@@ -1,0 +1,16 @@
+[package]
+name = "scoped-join-set"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lech Mazur <mazurlech@proton.me>"]
+license = "MIT OR Apache-2.0"
+description = "A scoped variant of tokio::task::JoinSet for spawning non-'static futures."
+repository = "https://github.com/Le-Maz/scoped-join-set"
+keywords = ["tokio", "async", "concurrency", "scoped", "joinset"]
+categories = ["asynchronous", "concurrency", "data-structures"]
+
+[dependencies]
+tokio = { version = "1.47.1", features = ["rt"] }
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "time", "sync"] }
