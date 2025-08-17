@@ -143,9 +143,9 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
         if Handle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
             return;
         }
-        tokio::task::block_in_place(|| {
-            drop(self.future.lock()); // just to wait before we go
-        });
+        if self.future.try_lock().is_err() {
+            ::tokio::task::block_in_place(|| drop(self.future.lock()));
+        }
     }
 }
 
