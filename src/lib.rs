@@ -1,8 +1,9 @@
-use tokio::task::Id;
+use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::task::{AbortHandle, Id};
 
 use std::any::Any;
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::{
     future::Future,
     pin::Pin,
@@ -55,12 +56,27 @@ where
     /// # Panics
     ///
     /// This method panics if called outside of a Tokio runtime.
-    pub fn spawn(&mut self, task: impl Future<Output = T> + Send + 'scope)
+    pub fn spawn<F>(&mut self, task: F)
     where
+        F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
-        let (holder, weak) = FutureHolder::new(task);
-        let handle = self.join_set.spawn(weak);
+        let strong: Arc<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>> =
+            Arc::new(Mutex::new(Box::pin(task)));
+
+        let weak_future = WeakFuture {
+            future: unsafe {
+                std::mem::transmute::<
+                    Weak<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>>,
+                    Weak<Mutex<dyn Future<Output = T> + Send + Unpin>>,
+                >(Arc::downgrade(&strong))
+            },
+        };
+        let handle = self.join_set.spawn(weak_future);
+        let holder = FutureHolder {
+            abort_handle: handle.clone(),
+            future: strong,
+        };
         self.holders.insert(handle.id(), holder);
     }
 
@@ -111,41 +127,34 @@ where
 /// Internally uses an `Arc<UnsafeCell<dyn Future>>` to allow safe access from the
 /// `poll` method in `WeakFuture`. Only `FutureHolder` owns the strong reference;
 /// once dropped, the weak reference becomes invalid and polling returns `None`.
-struct FutureHolder<'scope, T> {
-    future: Arc<UnsafeCell<dyn Future<Output = T> + Send + 'scope>>,
+struct FutureHolder<'scope, T>
+where
+    T: 'static,
+{
+    abort_handle: AbortHandle,
+    future: Arc<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>>,
 }
 
-// SAFETY: `FutureHolder` is `Send` because it only contains an `Arc<UnsafeCell<..>>`,
-// and the future inside must be `Send` + `'scope`.
-unsafe impl<'scope, T> Send for FutureHolder<'scope, T> {}
-
-impl<'scope, T> FutureHolder<'scope, T> {
-    /// Creates a new `FutureHolder` and returns a weak reference to the future.
-    ///
-    /// The weak reference will be used in the spawned task, while the holder remains in `ScopedJoinSet`.
-    fn new(future: impl Future<Output = T> + Send + 'scope) -> (Self, WeakFuture<T>) {
-        let holder = Self {
-            future: Arc::new(UnsafeCell::new(future)),
-        };
-        let weak = holder.get_weak();
-        (holder, weak)
-    }
-
-    /// Returns a `WeakFuture`, which is a `Weak` pointer to the internal future.
-    ///
-    /// SAFETY: Uses `transmute` to adjust lifetime to `'static` as required by Tokio,
-    /// but only valid because the strong reference is held in `ScopedJoinSet`.
-    fn get_weak(&self) -> WeakFuture<T> {
-        WeakFuture {
-            future: unsafe {
-                std::mem::transmute::<
-                    Weak<UnsafeCell<dyn Future<Output = T> + Send + 'scope>>,
-                    Weak<UnsafeCell<dyn Future<Output = T> + Send>>,
-                >(Arc::downgrade(&self.future))
-            },
+impl<'scope, T> Drop for FutureHolder<'scope, T> {
+    fn drop(&mut self) {
+        self.abort_handle.abort();
+        if Handle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
+            return;
         }
+        let cleanup_ref = self.future.clone();
+        let cleanup_ref = unsafe {
+            std::mem::transmute::<
+                Arc<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>>,
+                Arc<Mutex<dyn Future<Output = T> + Send + Unpin>>,
+            >(cleanup_ref)
+        };
+        tokio::task::block_in_place(move || {
+            drop(cleanup_ref.lock()); // just to wait before we go
+        });
     }
 }
+
+unsafe impl<'scope, T> Send for FutureHolder<'scope, T> {}
 
 /// A weak reference to a future, used inside the join set.
 ///
@@ -153,11 +162,9 @@ impl<'scope, T> FutureHolder<'scope, T> {
 /// Once the strong reference (`FutureHolder`) is dropped, the weak reference cannot be upgraded,
 /// and polling will return `Poll::Ready(None)`.
 struct WeakFuture<T> {
-    future: Weak<UnsafeCell<dyn Future<Output = T> + Send>>,
+    future: Weak<Mutex<dyn Future<Output = T> + Send + Unpin>>,
 }
 
-// SAFETY: `WeakFuture` is `Send` because it only accesses the future if the `Weak` is valid,
-// and polling happens from a Tokio task, which requires `Send`.
 unsafe impl<T> Send for WeakFuture<T> {}
 
 impl<T> Future for WeakFuture<T> {
@@ -165,14 +172,8 @@ impl<T> Future for WeakFuture<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(fut) = self.future.upgrade() {
-            let fut = unsafe { fut.get().as_mut().unwrap() };
-            // SAFETY: The `upgrade()` ensures that the `Arc` is alive, so the pointer from `UnsafeCell`
-            // is valid. The future is not moved after being placed in the `Arc`, so it is safe to
-            // construct a `Pin` from the raw pointer. This code assumes that only one task is polling
-            // the future at a time, preventing aliasing or concurrent access, which must be enforced
-            // by the context using `WeakFuture`.
-            let pinned = unsafe { Pin::new_unchecked(fut) };
-            Future::poll(pinned, cx).map(Some)
+            let mut fut = fut.lock().unwrap();
+            Future::poll(Pin::new(&mut *fut), cx).map(Some)
         } else {
             Poll::Ready(None)
         }
