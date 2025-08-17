@@ -143,9 +143,8 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
         if Handle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
             return;
         }
-        let cleanup_ref = self.future.clone();
-        tokio::task::block_in_place(move || {
-            drop(cleanup_ref.lock()); // just to wait before we go
+        tokio::task::block_in_place(|| {
+            drop(self.future.lock()); // just to wait before we go
         });
     }
 }
