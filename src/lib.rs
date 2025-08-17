@@ -1,19 +1,18 @@
 use tokio::{
     runtime::{Handle, RuntimeFlavor},
-    task::{AbortHandle, Id},
+    task::{AbortHandle, Id, JoinSet},
 };
 
-use std::any::Any;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::{
+    any::Any,
+    collections::HashMap,
+    error::Error,
+    fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
     task::{Context, Poll},
 };
-
-use tokio::task::JoinSet;
 
 type TokioJoinError = tokio::task::JoinError;
 
@@ -170,9 +169,6 @@ impl<T> Future for WeakFuture<T> {
         }
     }
 }
-
-use std::error::Error;
-use std::fmt;
 
 /// Represents failure when joining a task.
 #[derive(Debug)]
