@@ -1,5 +1,7 @@
-use tokio::runtime::{Handle, RuntimeFlavor};
-use tokio::task::{AbortHandle, Id};
+use tokio::{
+    runtime::{Handle, RuntimeFlavor},
+    task::{AbortHandle, Id},
+};
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -142,12 +144,6 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
             return;
         }
         let cleanup_ref = self.future.clone();
-        let cleanup_ref = unsafe {
-            std::mem::transmute::<
-                Arc<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>>,
-                Arc<Mutex<dyn Future<Output = T> + Send + Unpin>>,
-            >(cleanup_ref)
-        };
         tokio::task::block_in_place(move || {
             drop(cleanup_ref.lock()); // just to wait before we go
         });
