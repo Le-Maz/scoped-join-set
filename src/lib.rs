@@ -149,8 +149,6 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
     }
 }
 
-unsafe impl<'scope, T> Send for FutureHolder<'scope, T> {}
-
 /// A weak reference to a future, used inside the join set.
 ///
 /// If the weak reference can be upgraded, the future is still alive and will be polled.
@@ -159,8 +157,6 @@ unsafe impl<'scope, T> Send for FutureHolder<'scope, T> {}
 struct WeakFuture<T> {
     future: Weak<Mutex<dyn Future<Output = T> + Send + Unpin>>,
 }
-
-unsafe impl<T> Send for WeakFuture<T> {}
 
 impl<T> Future for WeakFuture<T> {
     type Output = Option<T>;
