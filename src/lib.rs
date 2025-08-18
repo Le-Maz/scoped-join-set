@@ -5,12 +5,13 @@ use tokio::{
 
 use std::{
     any::Any,
+    cell::UnsafeCell,
     collections::HashMap,
     error::Error,
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
     task::{Context, Poll},
 };
 
@@ -62,14 +63,14 @@ where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
-        let strong: Arc<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>> =
-            Arc::new(Mutex::new(Box::pin(task)));
+        let strong: Arc<UnsafeCell<dyn Future<Output = T> + Send + 'scope>> =
+            Arc::new(UnsafeCell::new(task));
 
         let weak_future = WeakFuture {
             future: unsafe {
                 std::mem::transmute::<
-                    Weak<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>>,
-                    Weak<Mutex<dyn Future<Output = T> + Send + Unpin>>,
+                    Weak<UnsafeCell<dyn Future<Output = T> + Send + 'scope>>,
+                    Weak<UnsafeCell<dyn Future<Output = T> + Send>>,
                 >(Arc::downgrade(&strong))
             },
         };
@@ -133,7 +134,7 @@ where
     T: 'static,
 {
     abort_handle: AbortHandle,
-    future: Arc<Mutex<dyn Future<Output = T> + Send + Unpin + 'scope>>,
+    future: Arc<UnsafeCell<dyn Future<Output = T> + Send + 'scope>>,
 }
 
 impl<'scope, T> Drop for FutureHolder<'scope, T> {
@@ -142,8 +143,8 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
         if Handle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
             return;
         }
-        if self.future.try_lock().is_err() {
-            ::tokio::task::block_in_place(|| drop(self.future.lock()));
+        if Arc::strong_count(&self.future) > 1 {
+            ::tokio::task::block_in_place(|| while Arc::strong_count(&self.future) > 1 {});
         }
     }
 }
@@ -154,16 +155,19 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
 /// Once the strong reference (`FutureHolder`) is dropped, the weak reference cannot be upgraded,
 /// and polling will return `Poll::Ready(None)`.
 struct WeakFuture<T> {
-    future: Weak<Mutex<dyn Future<Output = T> + Send + Unpin>>,
+    future: Weak<UnsafeCell<dyn Future<Output = T> + Send>>,
 }
+
+unsafe impl<T: Send> Send for WeakFuture<T> {}
 
 impl<T> Future for WeakFuture<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(fut) = self.future.upgrade() {
-            let mut fut = fut.lock().unwrap();
-            Future::poll(Pin::new(&mut *fut), cx).map(Some)
+            let fut = unsafe { fut.get().as_mut().unwrap() };
+            let fut = unsafe { Pin::new_unchecked(fut) };
+            Future::poll(fut, cx).map(Some)
         } else {
             Poll::Ready(None)
         }
