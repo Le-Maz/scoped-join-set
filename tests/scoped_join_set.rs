@@ -209,9 +209,6 @@ async fn test_dropping_set_while_tasks_pending() {
     // Drop before they complete
     drop(set);
 
-    // Wait a little to allow dropped futures to be cleaned up
-    sleep(Duration::from_millis(100)).await;
-
     // All tasks should be dropped
     assert_eq!(drop_count.load(Ordering::SeqCst), count);
 }
