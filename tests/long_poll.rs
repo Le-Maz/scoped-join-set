@@ -9,7 +9,7 @@ async fn long_poll() {
     scoped_join_set.spawn(async {
         poll_fn(|_| {
             let reference = &local_variable;
-            sleep(Duration::from_millis(500));
+            sleep(Duration::from_millis(100));
             std::task::Poll::Ready(reference.clone())
         })
         .await;
