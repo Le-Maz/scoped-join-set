@@ -144,7 +144,17 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
             return;
         }
         if Arc::strong_count(&self.future) > 1 {
-            ::tokio::task::block_in_place(|| while Arc::strong_count(&self.future) > 1 {});
+            ::tokio::task::block_in_place(|| {
+                let mut spin = 0;
+                while Arc::strong_count(&self.future) > 1 {
+                    spin += 1;
+                    if spin < 10 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+            });
         }
     }
 }
