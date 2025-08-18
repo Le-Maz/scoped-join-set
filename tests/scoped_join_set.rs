@@ -130,7 +130,7 @@ async fn test_panicking_task() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_many_tasks_complete_successfully() {
     let mut set = ScopedJoinSet::new();
     let num_tasks = 10_000;
@@ -154,7 +154,7 @@ async fn test_many_tasks_complete_successfully() {
     assert_eq!(sum, num_tasks * (num_tasks - 1) / 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_many_tasks_with_panics() {
     let mut set = ScopedJoinSet::new();
     let num_tasks = 1000;
@@ -183,7 +183,7 @@ async fn test_many_tasks_with_panics() {
     assert_eq!(panicked, num_tasks / 10);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_dropping_set_while_tasks_pending() {
     let drop_count = Arc::new(AtomicUsize::new(0));
 
@@ -213,7 +213,7 @@ async fn test_dropping_set_while_tasks_pending() {
     assert_eq!(drop_count.load(Ordering::SeqCst), count);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_interleaved_spawn_and_join() {
     let mut set = ScopedJoinSet::new();
 
@@ -236,7 +236,7 @@ async fn test_interleaved_spawn_and_join() {
     assert_eq!(count, 980);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_many_scoped_references() {
     fn spawn_scoped_refs<'a>(data: &'a [usize]) -> ScopedJoinSet<'a, usize> {
         let mut set = ScopedJoinSet::new();
