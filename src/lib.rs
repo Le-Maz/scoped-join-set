@@ -174,10 +174,11 @@ impl<T> Future for WeakFuture<T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(fut) = self.future.upgrade() {
-            let fut = unsafe { fut.get().as_mut().unwrap() };
-            let fut = unsafe { Pin::new_unchecked(fut) };
-            Future::poll(fut, cx).map(Some)
+        if let Some(future_arc) = self.future.upgrade() {
+            let maybe_future_ref = unsafe { future_arc.get().as_mut() };
+            let future_ref = unsafe { maybe_future_ref.unwrap_unchecked() };
+            let future_pin = unsafe { Pin::new_unchecked(future_ref) };
+            Future::poll(future_pin, cx).map(Some)
         } else {
             Poll::Ready(None)
         }
