@@ -124,6 +124,8 @@ where
     }
 }
 
+unsafe impl<'scope, T> Send for ScopedJoinSet<'scope, T> {}
+
 /// Holds a strong reference to the future so it can be upgraded by the `WeakFuture`.
 ///
 /// Internally uses an `Arc<UnsafeCell<dyn Future>>` to allow safe access from the
