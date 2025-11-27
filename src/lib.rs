@@ -1,20 +1,10 @@
-use std::{
-    any::Any,
-    collections::HashMap,
-    error::Error,
-    fmt,
-    future::Future,
-    mem::transmute,
-    pin::Pin,
-    ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
-    task::{Context, Poll},
-};
+mod future_wrappers;
 
-use tokio::{
-    runtime::{Handle, RuntimeFlavor},
-    task::{block_in_place, AbortHandle, Id, JoinSet},
-};
+use std::{any::Any, collections::HashMap, error::Error, fmt, future::Future};
+
+use tokio::task::{Id, JoinSet};
+
+use crate::future_wrappers::{split_spawn_task, FutureHolder};
 
 type TokioJoinError = tokio::task::JoinError;
 
@@ -62,21 +52,8 @@ where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
-        let alive: NonNull<AtomicBool> = Box::leak(Box::new(AtomicBool::new(true))).into();
-        let future: NonNull<F> = Box::leak(Box::new(task)).into();
-        let weak_future = unsafe {
-            type Src<'scope, T> = NonNull<dyn Future<Output = T> + 'scope>;
-            type Dst<T> = NonNull<dyn Future<Output = T>>;
-            let future = transmute::<Src<'scope, T>, Dst<T>>(future);
-            WeakFuture { future, alive }
-        };
-        let handle = self.join_set.spawn(weak_future);
-        let holder = FutureHolder {
-            abort_handle: handle.clone(),
-            future,
-            alive,
-        };
-        self.holders.insert(handle.id(), holder);
+        let (id, holder) = split_spawn_task(&mut self.join_set, task);
+        self.holders.insert(id, holder);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -102,65 +79,6 @@ where
 }
 
 unsafe impl<'scope, T> Send for ScopedJoinSet<'scope, T> {}
-
-struct FutureHolder<'scope, T>
-where
-    T: 'static,
-{
-    abort_handle: AbortHandle,
-    future: NonNull<dyn Future<Output = T> + Send + 'scope>,
-    alive: NonNull<AtomicBool>,
-}
-
-impl<'scope, T> Drop for FutureHolder<'scope, T> {
-    fn drop(&mut self) {
-        self.abort_handle.abort();
-
-        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
-            let alive = unsafe { self.alive.as_ref() };
-            // Wait until the future is not being polled
-            if alive.load(Ordering::Acquire) {
-                block_in_place(|| {
-                    while alive.load(Ordering::Acquire) {
-                        std::hint::spin_loop();
-                    }
-                });
-            }
-            drop(unsafe { Box::from_raw(self.future.as_ptr()) });
-            drop(unsafe { Box::from_raw(self.alive.as_mut()) });
-        } else {
-            drop(unsafe { Box::from_raw(self.future.as_ptr()) });
-        }
-    }
-}
-
-struct WeakFuture<T> {
-    future: NonNull<dyn Future<Output = T>>,
-    alive: NonNull<AtomicBool>,
-}
-
-impl<T> Drop for WeakFuture<T> {
-    fn drop(&mut self) {
-        // Release the polling flag
-        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
-            unsafe { self.alive.as_ref() }.store(false, Ordering::Release);
-        } else {
-            drop(unsafe { Box::from_raw(self.alive.as_mut()) });
-        }
-    }
-}
-
-unsafe impl<T: Send> Send for WeakFuture<T> {}
-
-impl<T> Future for WeakFuture<T> {
-    type Output = Option<T>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let future_ref = unsafe { self.future.as_mut() };
-        let future_pin = unsafe { Pin::new_unchecked(future_ref) };
-        Future::poll(future_pin, cx).map(Some)
-    }
-}
 
 #[derive(Debug)]
 pub enum JoinError {
