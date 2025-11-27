@@ -126,10 +126,11 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
                     }
                 });
             }
+            drop(unsafe { Box::from_raw(self.future.as_ptr()) });
+            drop(unsafe { Box::from_raw(self.alive.as_mut()) });
+        } else {
+            drop(unsafe { Box::from_raw(self.future.as_ptr()) });
         }
-
-        drop(unsafe { Box::from_raw(self.future.as_ptr()) });
-        drop(unsafe { Box::from_raw(self.alive.as_mut()) });
     }
 }
 
@@ -141,7 +142,11 @@ struct WeakFuture<T> {
 impl<T> Drop for WeakFuture<T> {
     fn drop(&mut self) {
         // Release the polling flag
-        unsafe { self.alive.as_ref() }.store(false, Ordering::Release);
+        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
+            unsafe { self.alive.as_ref() }.store(false, Ordering::Release);
+        } else {
+            drop(unsafe { Box::from_raw(self.alive.as_mut()) });
+        }
     }
 }
 
