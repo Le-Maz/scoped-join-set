@@ -1,5 +1,8 @@
 use scoped_join_set::ScopedJoinSet;
-use tokio::time::{sleep, Duration};
+use tokio::{
+    sync::Notify,
+    time::{sleep, Duration},
+};
 
 #[tokio::test]
 async fn basic_completion() {
@@ -38,11 +41,13 @@ async fn len_and_spawn() {
 
 #[tokio::test]
 async fn try_join_next_non_blocking() {
+    let notify = Notify::new();
     let mut set = ScopedJoinSet::<u32>::new();
 
     // Spawn a long task
     set.spawn(async {
         sleep(Duration::from_millis(50)).await;
+        notify.notify_waiters();
         42
     });
 
@@ -50,7 +55,8 @@ async fn try_join_next_non_blocking() {
     assert!(set.try_join_next().is_none());
 
     // Wait for it to complete
-    sleep(Duration::from_millis(60)).await;
+    notify.notified().await;
+    sleep(Duration::from_millis(10)).await;
 
     // Now try_join_next should return the result
     let res = set.try_join_next();
