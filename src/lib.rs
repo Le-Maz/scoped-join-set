@@ -114,6 +114,13 @@ where
         self.join_set.is_empty()
     }
 
+    /// Returns the number of tasks currently stored in the set.
+    ///
+    /// Equivalent to [`JoinSet::len`].
+    pub fn len(&self) -> usize {
+        self.holders.len()
+    }
+
     /// Waits for the next completed task in the set.
     ///
     /// Returns:
@@ -142,6 +149,82 @@ where
                 Some(Err(error.into()))
             }
         }
+    }
+
+    /// Attempts to join one completed task without awaiting.
+    ///
+    /// This method is **non-blocking** and returns immediately.
+    ///
+    /// Returns:
+    /// - `Some(Ok(T))` if a task has already completed successfully,
+    /// - `Some(Err(JoinError))` if a completed task was cancelled or panicked,
+    /// - `None` if **no** tasks have completed yet **or** the set is empty.
+    ///
+    /// This differs from [`join_next`](Self::join_next):
+    /// - `join_next()` **awaits** the next completed task.
+    /// - `try_join_next()` returns immediately without awaiting.
+    ///
+    /// # Cancellation Safety
+    ///
+    /// This method is always cancellation-safe, because it does not perform
+    /// any async operations and does not remove tasks unless they have
+    /// already finished.
+    pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
+        match self.join_set.try_join_next_with_id()? {
+            Ok((id, Some(bytes))) => {
+                // Remove the holder before reconstructing the value.
+                self.holders.remove(&id);
+
+                // SAFETY: The bytes originated from a valid instance of T.
+                let value = unsafe { from_bytes_unchecked(&bytes) };
+                Some(Ok(value))
+            }
+            Ok((id, None)) => {
+                self.holders.remove(&id);
+                Some(Err(JoinError::Cancelled))
+            }
+            Err(error) => {
+                self.holders.remove(&error.id());
+                Some(Err(error.into()))
+            }
+        }
+    }
+
+    /// Waits for all tasks in the set to complete, consuming the set and
+    /// returning a list of results.
+    ///
+    /// The returned results are in **completion order**, not spawn order.
+    ///
+    /// # Cancellation Safety
+    /// If this future is dropped, remaining tasks stay inside the set.
+    pub async fn join_all(mut self) -> Vec<Result<T, JoinError>> {
+        let mut results = Vec::with_capacity(self.len());
+        while let Some(res) = self.join_next().await {
+            results.push(res);
+        }
+        results
+    }
+
+    /// Aborts all currently-running tasks.
+    ///
+    /// This does **not** await task completion; it merely issues abort signals.
+    /// To also wait for them, call [`join_remaining`](#method.join_remaining)
+    /// or drop the entire set.
+    ///
+    /// After calling `abort_all`, the set will still contain all tasks until
+    /// they complete their aborts and are polled again.
+    pub fn abort_all(&mut self) {
+        for holder in self.holders.values_mut() {
+            holder.abort();
+        }
+    }
+
+    /// Aborts all tasks *and then waits for them to finish*.
+    ///
+    /// Unlike dropping the set, `shutdown` consumes it gracefully.
+    pub async fn shutdown(mut self) -> Vec<Result<T, JoinError>> {
+        self.abort_all();
+        self.join_all().await
     }
 }
 

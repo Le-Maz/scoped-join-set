@@ -128,6 +128,10 @@ impl<'scope, T: Send> FutureHolder<'scope, T> {
             });
         }
     }
+
+    pub(crate) fn abort(&self) {
+        self.abort_handle.abort();
+    }
 }
 
 impl<'scope, T: Send> Drop for FutureHolder<'scope, T> {
