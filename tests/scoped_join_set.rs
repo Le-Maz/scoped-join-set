@@ -6,7 +6,7 @@ use std::sync::{
 use tokio::time::{sleep, Duration};
 
 #[tokio::test]
-async fn test_basic_completion() {
+async fn basic_completion() {
     let mut set = ScopedJoinSet::new();
 
     set.spawn(async { 1 });
@@ -24,7 +24,7 @@ async fn test_basic_completion() {
 }
 
 #[tokio::test]
-async fn test_task_drops_properly() {
+async fn task_drops_properly() {
     let dropped = Arc::new(AtomicUsize::new(0));
 
     struct DropCounter(Arc<AtomicUsize>);
@@ -53,7 +53,7 @@ async fn test_task_drops_properly() {
 }
 
 #[tokio::test]
-async fn test_none_on_dropped_future() {
+async fn none_on_dropped_future() {
     let mut set = ScopedJoinSet::new();
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -69,14 +69,14 @@ async fn test_none_on_dropped_future() {
 }
 
 #[tokio::test]
-async fn test_join_next_returns_none_when_empty() {
+async fn join_next_returns_none_when_empty() {
     let mut set: ScopedJoinSet<i32> = ScopedJoinSet::new();
 
     assert!(set.join_next().await.is_none());
 }
 
 #[tokio::test]
-async fn test_scope_lifetime_enforced() {
+async fn scope_lifetime_enforced() {
     fn scoped_spawn<'a>(val: &'a i32) -> ScopedJoinSet<'a, i32> {
         let mut set = ScopedJoinSet::new();
         set.spawn(async move { *val });
@@ -90,7 +90,7 @@ async fn test_scope_lifetime_enforced() {
 }
 
 #[tokio::test]
-async fn test_tasks_run_concurrently() {
+async fn tasks_run_concurrently() {
     let started = AtomicUsize::new(0);
     let finished = AtomicUsize::new(0);
 
@@ -116,7 +116,7 @@ async fn test_tasks_run_concurrently() {
 }
 
 #[tokio::test]
-async fn test_panicking_task() {
+async fn panicking_task() {
     let mut set = ScopedJoinSet::new();
 
     set.spawn(async {
@@ -131,7 +131,7 @@ async fn test_panicking_task() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_many_tasks_complete_successfully() {
+async fn many_tasks_complete_successfully() {
     let mut set = ScopedJoinSet::new();
     let num_tasks = 10_000;
 
@@ -155,7 +155,7 @@ async fn test_many_tasks_complete_successfully() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_dropping_set_while_tasks_pending() {
+async fn dropping_set_while_tasks_pending() {
     let drop_count = Arc::new(AtomicUsize::new(0));
 
     struct DropMe(Arc<AtomicUsize>);
@@ -185,7 +185,7 @@ async fn test_dropping_set_while_tasks_pending() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_interleaved_spawn_and_join() {
+async fn interleaved_spawn_and_join() {
     let mut set = ScopedJoinSet::new();
 
     for i in 0..1000 {
@@ -208,7 +208,7 @@ async fn test_interleaved_spawn_and_join() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_many_scoped_references() {
+async fn many_scoped_references() {
     fn spawn_scoped_refs<'a>(data: &'a [usize]) -> ScopedJoinSet<'a, usize> {
         let mut set = ScopedJoinSet::new();
 
