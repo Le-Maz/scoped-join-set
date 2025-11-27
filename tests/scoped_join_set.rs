@@ -98,9 +98,9 @@ async fn test_tasks_run_concurrently() {
 
     for _ in 0..3 {
         set.spawn(async {
-            (&started).fetch_add(1, Ordering::SeqCst);
+            started.fetch_add(1, Ordering::SeqCst);
             sleep(Duration::from_millis(50)).await;
-            (&finished).fetch_add(1, Ordering::SeqCst);
+            finished.fetch_add(1, Ordering::SeqCst);
             1
         });
     }
