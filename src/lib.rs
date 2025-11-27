@@ -25,13 +25,20 @@
 //! ```
 //! use scoped_join_set::ScopedJoinSet;
 //!
-//! async fn demo<'a>() {
+//! #[tokio::main]
+//! async fn main() {
+//!     let temporary_value = Box::new(5);
+//!     let value_ref = &temporary_value;
+//!
 //!     let mut set = ScopedJoinSet::<u32>::new();
 //!
-//!     set.spawn(async { 5 });
+//!     set.spawn(async {
+//!         println!("I have a {value_ref}");
+//!         **value_ref
+//!     });
 //!
 //!     while let Some(result) = set.join_next().await {
-//!         assert_eq!(result.unwrap(), 5);
+//!         assert_eq!(result.unwrap(), *temporary_value);
 //!     }
 //! }
 //! ```
