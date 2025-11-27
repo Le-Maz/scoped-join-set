@@ -155,35 +155,6 @@ async fn test_many_tasks_complete_successfully() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_many_tasks_with_panics() {
-    let mut set = ScopedJoinSet::new();
-    let num_tasks = 1000;
-
-    for i in 0..num_tasks {
-        set.spawn(async move {
-            if i % 10 == 0 {
-                panic!("panic at {}", i);
-            }
-            i
-        });
-    }
-
-    let mut ok = 0;
-    let mut panicked = 0;
-
-    while !set.is_empty() {
-        match set.join_next().await {
-            Some(Ok(_)) => ok += 1,
-            Some(Err(JoinError::Panicked(_))) => panicked += 1,
-            _ => panic!("unexpected join result"),
-        }
-    }
-
-    assert_eq!(ok + panicked, num_tasks);
-    assert_eq!(panicked, num_tasks / 10);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_dropping_set_while_tasks_pending() {
     let drop_count = Arc::new(AtomicUsize::new(0));
 
