@@ -85,14 +85,14 @@ where
 /// `WeakFuture` to acknowledge termination via its shared `AtomicBool`.
 pub(crate) struct FutureHolder<'scope, T>
 where
-    T: 'static,
+    T: Send + 'static,
 {
     abort_handle: AbortHandle,
     future: NonNull<dyn Future<Output = T> + Send + 'scope>,
     alive: NonNull<AtomicBool>,
 }
 
-impl<'scope, T> FutureHolder<'scope, T> {
+impl<'scope, T: Send> FutureHolder<'scope, T> {
     /// Creates a new `FutureHolder`.
     ///
     /// # Parameters
@@ -130,7 +130,7 @@ impl<'scope, T> FutureHolder<'scope, T> {
     }
 }
 
-impl<'scope, T> Drop for FutureHolder<'scope, T> {
+impl<'scope, T: Send> Drop for FutureHolder<'scope, T> {
     fn drop(&mut self) {
         // Abort the running task.
         self.abort_handle.abort();
@@ -159,14 +159,14 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
 /// - `FutureHolder` waits for this `WeakFuture` to drop before reclaiming the
 ///   box.
 /// - The executor cannot outlive the scope where `FutureHolder` is dropped.
-pub(crate) struct WeakFuture<T: 'static> {
+pub(crate) struct WeakFuture<T: Send + 'static> {
     /// Placed behind a `'static` pinned reference via controlled transmute.
     future: Pin<&'static mut dyn Future<Output = T>>,
     /// Indication of whether this weak future is still alive.
     alive: NonNull<AtomicBool>,
 }
 
-impl<T: 'static> WeakFuture<T> {
+impl<T: Send + 'static> WeakFuture<T> {
     /// Constructs a new `WeakFuture` from a non-null pointer to a scoped
     /// future.
     ///
@@ -193,7 +193,7 @@ impl<T: 'static> WeakFuture<T> {
     }
 }
 
-impl<T> Drop for WeakFuture<T> {
+impl<T: Send> Drop for WeakFuture<T> {
     fn drop(&mut self) {
         // Release the polling flag when dropping.
         if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
@@ -207,7 +207,7 @@ impl<T> Drop for WeakFuture<T> {
 
 unsafe impl<T: Send> Send for WeakFuture<T> {}
 
-impl<T> Future for WeakFuture<T> {
+impl<T: Send> Future for WeakFuture<T> {
     type Output = Option<T>;
 
     /// Polls the underlying future, wrapping the result in `Some`.

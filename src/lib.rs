@@ -22,7 +22,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```
 //! use scoped_join_set::ScopedJoinSet;
 //!
 //! async fn demo<'a>() {
@@ -37,12 +37,16 @@
 //! ```
 
 mod future_wrappers;
+mod lifetime_obfuscation;
 
-use std::{any::Any, collections::HashMap, error::Error, fmt, future::Future};
+use std::{any::Any, collections::HashMap, error::Error, fmt, future::Future, marker::PhantomData};
 
 use tokio::task::{Id, JoinSet};
 
-use crate::future_wrappers::{split_spawn_task, FutureHolder};
+use crate::{
+    future_wrappers::{split_spawn_task, FutureHolder},
+    lifetime_obfuscation::{from_bytes_unchecked, obfuscate_lifetime},
+};
 
 type TokioJoinError = tokio::task::JoinError;
 
@@ -62,21 +66,23 @@ type TokioJoinError = tokio::task::JoinError;
 #[derive(Default)]
 pub struct ScopedJoinSet<'scope, T>
 where
-    T: 'static,
+    T: 'scope + Send,
 {
-    join_set: JoinSet<Option<T>>,
-    holders: HashMap<Id, FutureHolder<'scope, T>>,
+    join_set: JoinSet<Option<Box<[u8]>>>,
+    holders: HashMap<Id, FutureHolder<'scope, Box<[u8]>>>,
+    _marker: PhantomData<T>,
 }
 
 impl<'scope, T> ScopedJoinSet<'scope, T>
 where
-    T: 'static,
+    T: 'scope + Send,
 {
     /// Creates an empty `ScopedJoinSet`.
     pub fn new() -> Self {
         Self {
             join_set: JoinSet::new(),
             holders: HashMap::new(),
+            _marker: PhantomData,
         }
     }
 
@@ -96,6 +102,7 @@ where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
+        let task = obfuscate_lifetime(task);
         let (id, holder) = split_spawn_task(&mut self.join_set, task);
         self.holders.insert(id, holder);
     }
@@ -118,8 +125,12 @@ where
     /// `.await` does not remove the task from the set.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         match self.join_set.join_next_with_id().await? {
-            Ok((id, Some(value))) => {
+            Ok((id, Some(bytes))) => {
                 self.holders.remove(&id);
+
+                // SAFETY: By having `T` as the type argument, reconstruction needs to be successful.
+                let value = unsafe { from_bytes_unchecked(&bytes) };
+
                 Some(Ok(value))
             }
             Ok((id, None)) => {
@@ -134,7 +145,7 @@ where
     }
 }
 
-unsafe impl<'scope, T> Send for ScopedJoinSet<'scope, T> {}
+unsafe impl<'scope, T: Send> Send for ScopedJoinSet<'scope, T> {}
 
 /// Errors returned when joining scoped tasks.
 #[derive(Debug)]
