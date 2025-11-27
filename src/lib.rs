@@ -4,7 +4,9 @@ use std::{
     error::Error,
     fmt,
     future::Future,
+    mem::transmute,
     pin::Pin,
+    ptr::NonNull,
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
 };
@@ -60,21 +62,18 @@ where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
-        let alive: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(true)));
-        let strong = Box::leak(Box::new(task));
-        let weak_future = WeakFuture {
-            future: unsafe {
-                std::mem::transmute::<
-                    *mut (dyn Future<Output = T> + Send + 'scope),
-                    *mut dyn Future<Output = T>,
-                >((&raw const *strong).cast_mut())
-            },
-            alive,
+        let alive: NonNull<AtomicBool> = Box::leak(Box::new(AtomicBool::new(true))).into();
+        let future: NonNull<F> = Box::leak(Box::new(task)).into();
+        let weak_future = unsafe {
+            type Src<'scope, T> = NonNull<dyn Future<Output = T> + 'scope>;
+            type Dst<T> = NonNull<dyn Future<Output = T>>;
+            let future = transmute::<Src<'scope, T>, Dst<T>>(future);
+            WeakFuture { future, alive }
         };
         let handle = self.join_set.spawn(weak_future);
         let holder = FutureHolder {
             abort_handle: handle.clone(),
-            _future: strong,
+            future,
             alive,
         };
         self.holders.insert(handle.id(), holder);
@@ -109,8 +108,8 @@ where
     T: 'static,
 {
     abort_handle: AbortHandle,
-    _future: &'scope (dyn Future<Output = T> + Send + 'scope),
-    alive: &'static AtomicBool,
+    future: NonNull<dyn Future<Output = T> + Send + 'scope>,
+    alive: NonNull<AtomicBool>,
 }
 
 impl<'scope, T> Drop for FutureHolder<'scope, T> {
@@ -118,34 +117,31 @@ impl<'scope, T> Drop for FutureHolder<'scope, T> {
         self.abort_handle.abort();
 
         if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
+            let alive = unsafe { self.alive.as_ref() };
             // Wait until the future is not being polled
-            if self.alive.load(Ordering::Acquire) {
+            if alive.load(Ordering::Acquire) {
                 block_in_place(|| {
-                    while self.alive.load(Ordering::Acquire) {
+                    while alive.load(Ordering::Acquire) {
                         std::hint::spin_loop();
                     }
                 });
             }
         }
 
-        let future = &raw const *self._future;
-        let alive = &raw const *self.alive;
-        unsafe {
-            drop(Box::from_raw(future.cast_mut()));
-            drop(Box::from_raw(alive.cast_mut()));
-        }
+        drop(unsafe { Box::from_raw(self.future.as_ptr()) });
+        drop(unsafe { Box::from_raw(self.alive.as_mut()) });
     }
 }
 
 struct WeakFuture<T> {
-    future: *mut dyn Future<Output = T>,
-    alive: &'static AtomicBool,
+    future: NonNull<dyn Future<Output = T>>,
+    alive: NonNull<AtomicBool>,
 }
 
 impl<T> Drop for WeakFuture<T> {
     fn drop(&mut self) {
         // Release the polling flag
-        self.alive.store(false, Ordering::Release);
+        unsafe { self.alive.as_ref() }.store(false, Ordering::Release);
     }
 }
 
@@ -154,8 +150,8 @@ unsafe impl<T: Send> Send for WeakFuture<T> {}
 impl<T> Future for WeakFuture<T> {
     type Output = Option<T>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let future_ref = unsafe { self.future.as_mut().unwrap_unchecked() };
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let future_ref = unsafe { self.future.as_mut() };
         let future_pin = unsafe { Pin::new_unchecked(future_ref) };
         Future::poll(future_pin, cx).map(Some)
     }
