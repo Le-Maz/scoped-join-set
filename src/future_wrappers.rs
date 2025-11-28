@@ -168,7 +168,6 @@ pub struct WeakFuture {
 }
 
 unsafe impl Send for WeakFuture {}
-unsafe impl Sync for WeakFuture {}
 
 impl WeakFuture {
     /// Creates a weak future from a raw allocation.
