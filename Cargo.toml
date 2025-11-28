@@ -15,3 +15,7 @@ tokio = { version = "^1.48", features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 tokio = { version = "^1.48", features = ["macros", "time", "sync"] }
+
+[profile.bench]
+opt-level = 3
+debug = true
