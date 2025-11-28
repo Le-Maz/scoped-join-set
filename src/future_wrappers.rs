@@ -1,29 +1,32 @@
-//! Internal future wrapper utilities for [`ScopedJoinSet`](crate::ScopedJoinSet).
+//! Internal utilities for spawning and managing scoped futures in [`ScopedJoinSet`](crate::ScopedJoinSet).
 //!
-//! This module exposes two primary helpers:
+//! This module enables safe `'static` polling of user futures while keeping ownership and memory
+//! management under control. It exposes two main helpers:
 //!
-//! - [`split_spawn_task`] — accepts a user future and a [`JoinSet`] and returns
-//!   both an [`Id`] and a [`FutureHolder`] which owns the real future.
+//! - [`split_spawn_task`] — takes a user future and a [`JoinSet`], spawns a `'static` reference
+//!   of the future into the runtime, and returns a [`FutureHolder`] owning the allocation and the task [`Id`].
 //!
-//! - [`WeakFuture`] — a `'static` pinned reference to the future stored inside
-//!   `FutureHolder`. This is the value that Tokio actually polls. It is safe
-//!   only because each `WeakFuture` shares an `AtomicBool` with the
-//!   corresponding `FutureHolder`, allowing both to coordinate their drop
-//!   semantics.
+//! - [`WeakFuture`] — a `'static` pinned reference to the user future stored in a heap allocation.
+//!   This is the future that Tokio actually polls. Coordinated drops with [`FutureHolder`] are handled
+//!   via an `AtomicBool` flag, ensuring memory safety.
 //!
-//! ## Safety
+//! # Mechanism
 //!
-//! - Each spawned scoped task owns exactly one pinned future (`FutureHolder`)
-//!   and one `'static` reference used by Tokio (`WeakFuture`).
-//! - The `'static` cast in [`WeakFuture::new`] is safe **only** because
-//!   `FutureHolder` guarantees the real boxed future outlives the spawned task,
-//!   and the task is aborted/dropped before the box is reclaimed.
+//! 1. The user future is wrapped in [`WriteOutput`] so its output is stored in a heap-allocated `Option<T>` instead of being returned.
+//! 2. A contiguous memory block is allocated containing:
+//!    - an `AtomicBool` alive flag  
+//!    - the output storage `Option<T>`  
+//!    - the pinned user future  
+//! 3. [`WeakFuture`] points into this allocation and is spawned into the runtime.  
+//! 4. [`FutureHolder`] owns the allocation, can abort the task, waits for the weak future to complete, and deallocates memory safely.
 
 use std::{
+    alloc::{alloc, handle_alloc_error, Layout},
     future::Future,
+    marker::PhantomData,
     mem::transmute,
     pin::Pin,
-    ptr::NonNull,
+    ptr::{metadata, NonNull},
     sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
 };
@@ -33,93 +36,200 @@ use tokio::{
     task::{block_in_place, AbortHandle, Id, JoinSet},
 };
 
-/// Spawns a scoped future inside a [`JoinSet`], returning both its Tokio `Id`
-/// and a [`FutureHolder`] which owns the actual boxed future.
-///
-/// This function splits future ownership into:
-///
-/// - `WeakFuture`: a `'static` future handle inserted into the `JoinSet`.
-/// - `FutureHolder`: the real owner of the pinned boxed future.
-///
-/// The `'static` handle is created via a controlled and documented safe
-/// transmute, with safety guaranteed by the coordinated drop behavior between
-/// the two wrappers.
-///
-/// # Parameters
-/// - `join_set`: The [`JoinSet`] into which the future should be spawned.
-/// - `task`: The user future tied to the `'scope` lifetime.
-///
-/// # Returns
-/// `(task_id, future_holder)`
-///
-/// # Safety
-/// Safe only because `FutureHolder` ensures the future is not dropped until the
-/// weak future has finished executing and the runtime has completed its polling.
+/// Splits a user future into a `WeakFuture` and a `FutureHolder`, spawning the weak reference into the given `JoinSet`.
 pub(crate) fn split_spawn_task<'scope, F, T>(
-    join_set: &mut JoinSet<Option<T>>,
+    join_set: &mut JoinSet<()>,
     task: F,
 ) -> (Id, FutureHolder<'scope, T>)
 where
     F: Future<Output = T> + Send + 'scope,
-    T: Send + 'static,
+    T: Send + 'scope,
 {
-    // Shared flag indicating whether WeakFuture is still alive.
-    let alive: NonNull<AtomicBool> = Box::leak(Box::new(AtomicBool::new(true))).into();
-
-    // Allocate the true owning future.
-    let mut future: NonNull<F> = Box::leak(Box::new(task)).into();
-
-    // Create the weak polling future.
-    let weak_future = unsafe { WeakFuture::new(alive, &mut future) };
-
-    // Spawn the WeakFuture into the JoinSet.
+    let task_wrapper = WriteOutput::new(task);
+    let allocation_info = allocate_future_block(task_wrapper);
+    let weak_future = unsafe { WeakFuture::new(allocation_info.alive, allocation_info.future) };
     let handle = join_set.spawn(weak_future);
-
-    (handle.id(), FutureHolder::new(alive, future, &handle))
+    let future_holder = FutureHolder::new(handle.clone(), allocation_info);
+    (handle.id(), future_holder)
 }
 
-/// Owns the actual pinned boxed future and ensures correct destruction
-/// ordering relative to the corresponding [`WeakFuture`].
-///
-/// Dropping a `FutureHolder` aborts its task, then optionally waits for the
-/// `WeakFuture` to acknowledge termination via its shared `AtomicBool`.
-pub(crate) struct FutureHolder<'scope, T>
-where
-    T: Send + 'static,
-{
-    abort_handle: AbortHandle,
-    future: NonNull<dyn Future<Output = T> + Send + 'scope>,
+/// Metadata and pointers for a heap allocation holding the alive flag, output storage, and user future.
+struct AllocationInfo<'scope, T> {
+    base: NonNull<u8>,
     alive: NonNull<AtomicBool>,
+    output: NonNull<Option<T>>,
+    future: NonNull<dyn Future<Output = ()> + Send + 'scope>,
+    layout: Layout,
 }
 
-impl<'scope, T: Send> FutureHolder<'scope, T> {
-    /// Creates a new `FutureHolder`.
-    ///
-    /// # Parameters
-    /// - `alive`: Pointer to the shared liveness flag.
-    /// - `future`: Pointer to the boxed future being owned.
-    /// - `handle`: The abort handle for the associated task.
-    fn new<F>(
-        alive: NonNull<AtomicBool>,
-        future: NonNull<F>,
-        handle: &AbortHandle,
-    ) -> FutureHolder<'scope, T>
-    where
-        F: Future<Output = T> + 'scope + Send,
-    {
-        FutureHolder {
-            abort_handle: handle.clone(),
+/// Allocates memory for a user future wrapped in `WriteOutput` and returns metadata needed for `WeakFuture` and `FutureHolder`.
+fn allocate_future_block<'scope, F, T>(
+    mut task_wrapper: WriteOutput<F, T>,
+) -> AllocationInfo<'scope, T>
+where
+    F: Future<Output = T> + Send + 'scope,
+    T: Send + 'scope,
+{
+    let source_ptr =
+        NonNull::from(&mut task_wrapper) as NonNull<dyn Future<Output = ()> + Send + 'scope>;
+    let task_metadata = metadata(source_ptr.as_ptr());
+
+    let layout = Layout::new::<AtomicBool>();
+    let (layout, output_offset) = layout
+        .extend(Layout::new::<Option<T>>().pad_to_align())
+        .unwrap();
+    let (layout, future_offset) = layout
+        .extend(task_metadata.layout().pad_to_align())
+        .unwrap();
+
+    let allocation = unsafe { alloc(layout.pad_to_align()) };
+    let allocation = NonNull::new(allocation).unwrap_or_else(|| handle_alloc_error(layout));
+
+    let alive_ptr: NonNull<AtomicBool> = allocation.cast();
+    unsafe { alive_ptr.write(AtomicBool::new(true)) };
+
+    let output_ptr: NonNull<Option<T>> = unsafe { allocation.add(output_offset).cast() };
+    unsafe { task_wrapper.set_output_ptr(output_ptr) };
+
+    let future_byte_ptr = unsafe { allocation.add(future_offset) };
+    let future_ptr: NonNull<dyn Future<Output = ()> + Send + 'scope> =
+        NonNull::from_raw_parts(future_byte_ptr, task_metadata);
+
+    unsafe {
+        std::ptr::copy_nonoverlapping::<u8>(
+            source_ptr.as_ptr().cast(),
+            future_ptr.as_ptr().cast(),
+            task_metadata.size_of(),
+        );
+    }
+
+    std::mem::forget(task_wrapper);
+
+    AllocationInfo {
+        base: allocation,
+        alive: alive_ptr,
+        output: output_ptr,
+        future: future_ptr,
+        layout,
+    }
+}
+
+/// Wraps a user future and stores its output in heap storage instead of returning it directly.
+pub struct WriteOutput<F, T> {
+    future: F,
+    output_ptr: Option<NonNull<Option<T>>>,
+}
+
+unsafe impl<F, T> Send for WriteOutput<F, T> {}
+
+impl<F, T> WriteOutput<F, T> {
+    /// Wraps a user future with no output pointer yet.
+    pub fn new(future: F) -> Self {
+        Self {
             future,
-            alive,
+            output_ptr: None,
         }
     }
 
-    /// Spins until the weak future signals that polling has terminated.
+    /// Sets the pointer to heap storage for the output.
     ///
-    /// Used only in the multithreaded runtime; single-threaded runtimes drop
-    /// synchronously and cannot require spinning.
-    fn spin_until_termination(&mut self) {
-        let alive = unsafe { self.alive.as_ref() };
+    /// # Safety
+    /// The pointer must remain valid until the future completes or is dropped.
+    pub unsafe fn set_output_ptr(&mut self, ptr: NonNull<Option<T>>) {
+        self.output_ptr = Some(ptr);
+    }
+}
+
+impl<F, T> Future for WriteOutput<F, T>
+where
+    F: Future<Output = T>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(&mut this.future) };
+
+        match fut.poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(output) => {
+                let ptr = this.output_ptr.expect("output pointer not set");
+                unsafe { ptr.as_ptr().write(Some(output)) };
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+/// A `'static` future that references a user future in heap memory. Polled by Tokio without owning the allocation.
+pub struct WeakFuture {
+    alive: NonNull<AtomicBool>,
+    future: NonNull<dyn Future<Output = ()> + Send + 'static>,
+}
+
+unsafe impl Send for WeakFuture {}
+unsafe impl Sync for WeakFuture {}
+
+impl WeakFuture {
+    /// Creates a weak future from a raw allocation.
+    ///
+    /// # Safety
+    /// The allocation must outlive this weak reference. Drop is coordinated via `alive`.
+    unsafe fn new<'scope>(
+        alive: NonNull<AtomicBool>,
+        future: NonNull<dyn Future<Output = ()> + Send + 'scope>,
+    ) -> Self {
+        let future: NonNull<dyn Future<Output = ()> + Send + 'static> = transmute(future);
+        Self { alive, future }
+    }
+}
+
+impl Future for WeakFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+        let fut = unsafe { Pin::new_unchecked(this.future.as_mut()) };
+        fut.poll(cx)
+    }
+}
+
+impl Drop for WeakFuture {
+    fn drop(&mut self) {
+        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
+            unsafe { self.alive.as_ref().store(false, Ordering::Release) };
+        }
+    }
+}
+
+/// Owns a heap allocation containing a user future and its output storage.
+/// Responsible for aborting the task, waiting for completion, and deallocating memory.
+pub(crate) struct FutureHolder<'scope, T>
+where
+    T: Send + 'scope,
+{
+    abort_handle: AbortHandle,
+    allocation: AllocationInfo<'scope, T>,
+    _marker: PhantomData<&'scope ()>,
+}
+
+impl<'scope, T: Send + 'scope> FutureHolder<'scope, T> {
+    fn new(abort_handle: AbortHandle, allocation: AllocationInfo<'scope, T>) -> Self {
+        Self {
+            abort_handle,
+            allocation,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Consumes the holder and returns the stored output if available.
+    pub(crate) fn get_output(mut self) -> Option<T> {
+        unsafe { self.allocation.output.as_mut() }.take()
+    }
+
+    /// Spins until the weak future signals termination.
+    fn spin_until_termination(&self) {
+        let alive: &AtomicBool = unsafe { self.allocation.base.cast().as_ref() };
         if alive.load(Ordering::Acquire) {
             block_in_place(|| {
                 while alive.load(Ordering::Acquire) {
@@ -129,93 +239,24 @@ impl<'scope, T: Send> FutureHolder<'scope, T> {
         }
     }
 
+    /// Aborts the running task.
     pub(crate) fn abort(&self) {
         self.abort_handle.abort();
     }
 }
 
-impl<'scope, T: Send> Drop for FutureHolder<'scope, T> {
+impl<'scope, T: Send + 'scope> Drop for FutureHolder<'scope, T> {
     fn drop(&mut self) {
-        // Abort the running task.
         self.abort_handle.abort();
 
-        // Wait for WeakFuture to finish if we are multithreaded.
         if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
             self.spin_until_termination();
-            // Now free the liveness flag.
-            drop(unsafe { Box::from_raw(self.alive.as_mut()) });
         }
 
-        // Finally reclaim the future itself.
-        drop(unsafe { Box::from_raw(self.future.as_ptr()) });
-    }
-}
-
-/// A `'static` weak reference to a user future.
-///
-/// This wrapper is the object passed to Tokio's scheduler. Its existence allows
-/// the real future to remain owned by [`FutureHolder`] while maintaining a
-/// `'static` reference in the executor.
-///
-/// # Safety
-/// The `'static` lifetime is sound because:
-/// - The future is allocated inside a leaked `Box`, owned by `FutureHolder`.
-/// - `FutureHolder` waits for this `WeakFuture` to drop before reclaiming the
-///   box.
-/// - The executor cannot outlive the scope where `FutureHolder` is dropped.
-pub(crate) struct WeakFuture<T: Send + 'static> {
-    /// Placed behind a `'static` pinned reference via controlled transmute.
-    future: Pin<&'static mut dyn Future<Output = T>>,
-    /// Indication of whether this weak future is still alive.
-    alive: NonNull<AtomicBool>,
-}
-
-impl<T: Send + 'static> WeakFuture<T> {
-    /// Constructs a new `WeakFuture` from a non-null pointer to a scoped
-    /// future.
-    ///
-    /// # Safety
-    ///
-    /// - `future` must point to a valid boxed future whose lifetime exceeds that
-    ///   of the returned `WeakFuture`.
-    /// - The returned `'static` reference is only sound because the caller
-    ///   ensures coordinated destruction with `FutureHolder`.
-    unsafe fn new<'scope, F>(alive: NonNull<AtomicBool>, future: &mut NonNull<F>) -> WeakFuture<T>
-    where
-        F: Future<Output = T> + 'scope,
-    {
-        type Src<'scope, T> = &'scope mut dyn Future<Output = T>;
-        type Dst<T> = &'static mut dyn Future<Output = T>;
-
-        let future = unsafe { future.as_mut() };
-        let future = unsafe { transmute::<Src<'scope, T>, Dst<T>>(future) };
-
-        WeakFuture {
-            future: unsafe { Pin::new_unchecked(future) },
-            alive,
+        unsafe {
+            std::ptr::drop_in_place(self.allocation.output.as_ptr());
+            std::ptr::drop_in_place(self.allocation.future.as_ptr());
+            std::alloc::dealloc(self.allocation.base.cast().as_ptr(), self.allocation.layout);
         }
-    }
-}
-
-impl<T: Send> Drop for WeakFuture<T> {
-    fn drop(&mut self) {
-        // Release the polling flag when dropping.
-        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
-            unsafe { self.alive.as_ref() }.store(false, Ordering::Release);
-        } else {
-            // Single-thread runtime: synchronous, free immediately.
-            drop(unsafe { Box::from_raw(self.alive.as_mut()) });
-        }
-    }
-}
-
-unsafe impl<T: Send> Send for WeakFuture<T> {}
-
-impl<T: Send> Future for WeakFuture<T> {
-    type Output = Option<T>;
-
-    /// Polls the underlying future, wrapping the result in `Some`.
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Future::poll(self.future.as_mut(), cx).map(Some)
     }
 }

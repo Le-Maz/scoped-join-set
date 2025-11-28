@@ -1,28 +1,22 @@
 //! A scoped, lifetime-aware wrapper around [`tokio::task::JoinSet`].
 //!
-//! `ScopedJoinSet` enables dynamically spawning async tasks whose futures are
-//! tied to a specific Rust lifetime `'scope`. This provides a safe alternative
-//! to hand-managed `unsafe` approaches while enabling advanced async task
-//! orchestration where futures do **not** need to be `'static`.
+//! `ScopedJoinSet` allows spawning async tasks whose futures are tied to a specific Rust
+//! lifetime `'scope`. Unlike regular Tokio tasks, futures do **not** need to be `'static`.
 //!
-//! Each spawned task is split into:
+//! Each spawned task consists of:
+//! - A [`FutureHolder`], which owns the heap-allocated future and coordinates memory cleanup.
+//! - A [`WeakFuture`] inside the `JoinSet`, which is actually polled by Tokio.
 //!
-//! - A [`FutureHolder`], owning the actual boxed future and ensuring proper drop
-//!   ordering.
-//! - A [`WeakFuture`] (inside the `JoinSet`), which the Tokio runtime polls.
-//!
-//! When the [`ScopedJoinSet`] is dropped, all tasks are aborted and all future
-//! memory is reclaimed safely.
+//! When the `ScopedJoinSet` is dropped, all tasks are aborted and memory is reclaimed safely.
 //!
 //! # Guarantees
-//!
-//! - Futures spawned via [`ScopedJoinSet::spawn`] cannot outlive `'scope`.
-//! - `join_next()` is cancellation-safe.
-//! - Dropping the entire set aborts all tasks.
+//! - Futures cannot outlive `'scope`.
+//! - `join_next()` and `try_join_next()` are cancellation-safe.
+//! - Dropping the set aborts all tasks.
 //!
 //! # Example
 //!
-//! ```
+//! ```rust
 //! use scoped_join_set::ScopedJoinSet;
 //!
 //! #[tokio::main]
@@ -43,40 +37,32 @@
 //! }
 //! ```
 
+#![feature(ptr_metadata)]
+
 mod future_wrappers;
-mod lifetime_obfuscation;
 
+use crate::future_wrappers::{split_spawn_task, FutureHolder};
 use std::{any::Any, collections::HashMap, error::Error, fmt, future::Future, marker::PhantomData};
-
 use tokio::task::{Id, JoinSet};
-
-use crate::{
-    future_wrappers::{split_spawn_task, FutureHolder},
-    lifetime_obfuscation::{from_bytes_unchecked, obfuscate_lifetime},
-};
 
 type TokioJoinError = tokio::task::JoinError;
 
-/// A scoped wrapper around [`tokio::task::JoinSet`] for dynamically spawning
-/// futures with a lifetime `'scope`.
+/// A scoped wrapper around [`tokio::task::JoinSet`] that allows spawning futures with a
+/// non-`'static` lifetime `'scope`.
 ///
-/// Unlike normal Tokio tasks requiring `'static` futures, this set accepts
-/// futures tied to a temporary stack lifetime, as long as the
-/// `ScopedJoinSet` lives long enough.
-///
-/// Each call to [`spawn`](Self::spawn) places a non-`'static` future into the
-/// runtime via a controlled internal mechanism (`FutureHolder` + `WeakFuture`).
+/// Futures are safely stored in heap allocations and polled via `WeakFuture`, while
+/// `FutureHolder` ensures proper abort and memory management.
 ///
 /// # Type Parameters
 /// - `'scope`: The lifetime during which spawned futures must live.
-/// - `T`: The output of each spawned future.
+/// - `T`: The output type of each spawned future.
 #[derive(Default)]
 pub struct ScopedJoinSet<'scope, T>
 where
     T: 'scope + Send,
 {
-    join_set: JoinSet<Option<Box<[u8]>>>,
-    holders: HashMap<Id, FutureHolder<'scope, Box<[u8]>>>,
+    join_set: JoinSet<()>,
+    holders: HashMap<Id, FutureHolder<'scope, T>>,
     _marker: PhantomData<T>,
 }
 
@@ -84,7 +70,7 @@ impl<'scope, T> ScopedJoinSet<'scope, T>
 where
     T: 'scope + Send,
 {
-    /// Creates an empty `ScopedJoinSet`.
+    /// Creates a new, empty `ScopedJoinSet`.
     pub fn new() -> Self {
         Self {
             join_set: JoinSet::new(),
@@ -95,35 +81,22 @@ where
 
     /// Spawns a new scoped future into the set.
     ///
-    /// This function is analogous to [`tokio::spawn`], but accepts futures with
-    /// the given scope lifetime.
-    ///
-    /// # Parameters
-    /// - `task`: The user future to spawn.
-    ///
-    /// # Requirements
-    /// - The returned value `T` must be `Send`.
-    /// - The future must be `Send` and live at least `'scope`.
+    /// Accepts any future that is `Send` and lives at least `'scope`.
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
-        let task = obfuscate_lifetime(task);
         let (id, holder) = split_spawn_task(&mut self.join_set, task);
         self.holders.insert(id, holder);
     }
 
-    /// Returns whether no tasks remain.
-    ///
-    /// Equivalent to [`JoinSet::is_empty`].
+    /// Returns true if no tasks remain.
     pub fn is_empty(&self) -> bool {
         self.join_set.is_empty()
     }
 
-    /// Returns the number of tasks currently stored in the set.
-    ///
-    /// Equivalent to [`JoinSet::len`].
+    /// Returns the number of tasks currently stored.
     pub fn len(&self) -> usize {
         self.holders.len()
     }
@@ -131,25 +104,17 @@ where
     /// Waits for the next completed task in the set.
     ///
     /// Returns:
-    /// - `Some(Ok(T))` on success.
-    /// - `Some(Err(JoinError))` on cancellation or panic.
-    /// - `None` when the set is empty.
+    /// - `Some(Ok(T))` if a task completes successfully.
+    /// - `Some(Err(JoinError))` if a task was cancelled or panicked.
+    /// - `None` if the set is empty.
     ///
-    /// This method is **cancellation-safe**: dropping the future returned by
-    /// `.await` does not remove the task from the set.
+    /// Cancellation-safe: dropping the returned future does not remove tasks.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         match self.join_set.join_next_with_id().await? {
-            Ok((id, Some(bytes))) => {
-                self.holders.remove(&id);
-
-                // SAFETY: By having `T` as the type argument, reconstruction needs to be successful.
-                let value = unsafe { from_bytes_unchecked(&bytes) };
-
-                Some(Ok(value))
-            }
-            Ok((id, None)) => {
-                self.holders.remove(&id);
-                Some(Err(JoinError::Cancelled))
+            Ok((id, _)) => {
+                let holder = self.holders.remove(&id)?;
+                let output = holder.get_output().ok_or(JoinError::Cancelled);
+                Some(output)
             }
             Err(error) => {
                 self.holders.remove(&error.id());
@@ -160,35 +125,16 @@ where
 
     /// Attempts to join one completed task without awaiting.
     ///
-    /// This method is **non-blocking** and returns immediately.
-    ///
-    /// Returns:
-    /// - `Some(Ok(T))` if a task has already completed successfully,
-    /// - `Some(Err(JoinError))` if a completed task was cancelled or panicked,
-    /// - `None` if **no** tasks have completed yet **or** the set is empty.
-    ///
-    /// This differs from [`join_next`](Self::join_next):
-    /// - `join_next()` **awaits** the next completed task.
-    /// - `try_join_next()` returns immediately without awaiting.
-    ///
-    /// # Cancellation Safety
-    ///
-    /// This method is always cancellation-safe, because it does not perform
-    /// any async operations and does not remove tasks unless they have
-    /// already finished.
+    /// Returns immediately with:
+    /// - `Some(Ok(T))` for a completed task,
+    /// - `Some(Err(JoinError))` for a cancelled or panicked task,
+    /// - `None` if no tasks have completed or the set is empty.
     pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
         match self.join_set.try_join_next_with_id()? {
-            Ok((id, Some(bytes))) => {
-                // Remove the holder before reconstructing the value.
-                self.holders.remove(&id);
-
-                // SAFETY: The bytes originated from a valid instance of T.
-                let value = unsafe { from_bytes_unchecked(&bytes) };
-                Some(Ok(value))
-            }
-            Ok((id, None)) => {
-                self.holders.remove(&id);
-                Some(Err(JoinError::Cancelled))
+            Ok((id, _)) => {
+                let holder = self.holders.remove(&id)?;
+                let output = holder.get_output().ok_or(JoinError::Cancelled);
+                Some(output)
             }
             Err(error) => {
                 self.holders.remove(&error.id());
@@ -197,13 +143,9 @@ where
         }
     }
 
-    /// Waits for all tasks in the set to complete, consuming the set and
-    /// returning a list of results.
+    /// Waits for all tasks to complete, consuming the set.
     ///
-    /// The returned results are in **completion order**, not spawn order.
-    ///
-    /// # Cancellation Safety
-    /// If this future is dropped, remaining tasks stay inside the set.
+    /// Returns results in completion order. Cancellation-safe.
     pub async fn join_all(mut self) -> Vec<Result<T, JoinError>> {
         let mut results = Vec::with_capacity(self.len());
         while let Some(res) = self.join_next().await {
@@ -214,21 +156,16 @@ where
 
     /// Aborts all currently-running tasks.
     ///
-    /// This does **not** await task completion; it merely issues abort signals.
-    /// To also wait for them, call [`join_remaining`](#method.join_remaining)
-    /// or drop the entire set.
-    ///
-    /// After calling `abort_all`, the set will still contain all tasks until
-    /// they complete their aborts and are polled again.
+    /// Tasks remain in the set until they are completed or polled again.
     pub fn abort_all(&mut self) {
         for holder in self.holders.values_mut() {
             holder.abort();
         }
     }
 
-    /// Aborts all tasks *and then waits for them to finish*.
+    /// Aborts all tasks and waits for them to finish.
     ///
-    /// Unlike dropping the set, `shutdown` consumes it gracefully.
+    /// Consumes the set and returns a list of results.
     pub async fn shutdown(mut self) -> Vec<Result<T, JoinError>> {
         self.abort_all();
         self.join_all().await
@@ -240,9 +177,9 @@ unsafe impl<'scope, T: Send> Send for ScopedJoinSet<'scope, T> {}
 /// Errors returned when joining scoped tasks.
 #[derive(Debug)]
 pub enum JoinError {
-    /// The task was cancelled or aborted.
+    /// Task was cancelled or aborted.
     Cancelled,
-    /// The task panicked and its panic payload is returned.
+    /// Task panicked; payload returned.
     Panicked(Box<dyn Any + Send + 'static>),
 }
 
@@ -258,12 +195,12 @@ impl fmt::Display for JoinError {
 impl Error for JoinError {}
 
 impl JoinError {
-    /// Returns `true` if the task was cancelled.
+    /// Returns true if the task was cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, JoinError::Cancelled)
     }
 
-    /// Returns `true` if the task panicked.
+    /// Returns true if the task panicked.
     pub fn is_panic(&self) -> bool {
         matches!(self, JoinError::Panicked(_))
     }
