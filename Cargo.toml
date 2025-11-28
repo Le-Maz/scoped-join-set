@@ -1,6 +1,6 @@
 [package]
 name = "scoped-join-set"
-version = "0.4.2"
+version = "0.5.0"
 readme = "README.md"
 edition = "2021"
 authors = ["Lech Mazur <mazurlech@proton.me>"]
@@ -11,7 +11,7 @@ keywords = ["tokio", "async", "concurrency", "scoped", "joinset"]
 categories = ["asynchronous", "concurrency", "data-structures"]
 
 [dependencies]
-tokio = { version = "^1.47", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "^1.48", features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
-tokio = { version = "^1.47", features = ["macros", "time", "sync"] }
+tokio = { version = "^1.48", features = ["macros", "time", "sync"] }
