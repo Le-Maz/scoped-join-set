@@ -1,18 +1,19 @@
-//! A scoped, lifetime-aware wrapper around [`tokio::task::JoinSet`].
+//! A scoped wrapper around [`tokio::task::JoinSet`] allowing non-`'static`
+//! futures to be spawned safely.
 //!
-//! `ScopedJoinSet` allows spawning async tasks whose futures are tied to a specific Rust
-//! lifetime `'scope`. Unlike regular Tokio tasks, futures do **not** need to be `'static`.
+//! # What `ScopedJoinSet` provides
 //!
-//! Each spawned task consists of:
-//! - A [`FutureHolder`], which owns the heap-allocated future and coordinates memory cleanup.
-//! - A [`WeakFuture`] inside the `JoinSet`, which is actually polled by Tokio.
+//! Tokio requires all spawned tasks to be `'static`. `ScopedJoinSet` lifts
+//! this restriction by:
 //!
-//! When the `ScopedJoinSet` is dropped, all tasks are aborted and memory is reclaimed safely.
+//! - allocating each user future on the heap,
+//! - pinning it so it never moves,
+//! - unsafely casting it to `'static` (valid because the allocation is
+//!   retained until the task completes),
+//! - storing the task's output in `Box<Option<T>>`,
+//! - retrieving and deallocating that output when the task completes.
 //!
-//! # Guarantees
-//! - Futures cannot outlive `'scope`.
-//! - `join_next()` and `try_join_next()` are cancellation-safe.
-//! - Dropping the set aborts all tasks.
+//! This lets users write:
 //!
 //! # Example
 //!
@@ -36,41 +37,59 @@
 //!     }
 //! }
 //! ```
+//!
+//! without requiring the future to be `'static`.
+//!
+//! # How it works internally
+//!
+//! 1. `spawn()` allocates a `Box<Option<T>>` for the result and leaks it.
+//! 2. The user future is wrapped in `WriteOutput`, which writes its output
+//!    into this storage.
+//! 3. The wrapper future is pinned and unsafely converted to `'static`.
+//! 4. Tokio polls the wrapper; `ScopedJoinSet` tracks the task ID and the
+//!    output pointer.
+//! 5. `join_next()` retrieves and deallocates the result.
+//! 6. `Drop` aborts all active tasks and reclaims leaked storage.
+//!
+//! There is *no* self-referential struct and no dependence on pinning beyond
+//! guaranteeing that the wrapped future remains immovable.
 
 #![feature(ptr_metadata)]
 
 mod future_wrappers;
 
-use crate::future_wrappers::{split_spawn_task, FutureHolder};
-use std::{any::Any, collections::HashMap, error::Error, fmt, future::Future, marker::PhantomData};
-use tokio::task::{Id, JoinSet};
+use crate::future_wrappers::WriteOutput;
+use std::{
+    any::Any, collections::HashMap, error::Error, fmt, future::Future, hint::spin_loop,
+    marker::PhantomData, ptr::NonNull,
+};
+use tokio::{
+    runtime::{Handle, RuntimeFlavor},
+    task::{block_in_place, AbortHandle, Id, JoinSet},
+};
 
 type TokioJoinError = tokio::task::JoinError;
 
-/// A scoped wrapper around [`tokio::task::JoinSet`] that allows spawning futures with a
-/// non-`'static` lifetime `'scope`.
+/// A scoped task set analogous to [`tokio::task::JoinSet`] but requiring
+/// only `'scope` instead of `'static` futures.
 ///
-/// Futures are safely stored in heap allocations and polled via `WeakFuture`, while
-/// `FutureHolder` ensures proper abort and memory management.
-///
-/// # Type Parameters
-/// - `'scope`: The lifetime during which spawned futures must live.
-/// - `T`: The output type of each spawned future.
+/// All tasks produce an output of type `T`. Results are returned in
+/// completion order by `join_next()` and related methods.
 #[derive(Default)]
 pub struct ScopedJoinSet<'scope, T>
 where
     T: 'scope + Send,
 {
     join_set: JoinSet<()>,
-    holders: HashMap<Id, FutureHolder<'scope, T>>,
-    _marker: PhantomData<T>,
+    holders: HashMap<Id, (AbortHandle, NonNull<Option<T>>)>,
+    _marker: PhantomData<&'scope T>,
 }
 
 impl<'scope, T> ScopedJoinSet<'scope, T>
 where
     T: 'scope + Send,
 {
-    /// Creates a new, empty `ScopedJoinSet`.
+    /// Create an empty `ScopedJoinSet`.
     pub fn new() -> Self {
         Self {
             join_set: JoinSet::new(),
@@ -79,93 +98,82 @@ where
         }
     }
 
-    /// Spawns a new scoped future into the set.
-    ///
-    /// Accepts any future that is `Send` and lives at least `'scope`.
+    /// Spawn a non-`'static` future into the set.
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
-        let (id, holder) = split_spawn_task(&mut self.join_set, task);
-        self.holders.insert(id, holder);
+        // Allocate output slot.
+        let output = Box::leak(Box::new(None)).into();
+
+        // Wrap + convert to 'static future.
+        let task = WriteOutput::new(task, output);
+        let task = unsafe { task.into_static() };
+
+        let handle = self.join_set.spawn(task);
+        self.holders.insert(handle.id(), (handle, output));
     }
 
-    /// Returns true if no tasks remain.
+    /// Returns `true` if no tasks remain.
     pub fn is_empty(&self) -> bool {
         self.join_set.is_empty()
     }
 
-    /// Returns the number of tasks currently stored.
+    /// Returns the number of active tasks.
     pub fn len(&self) -> usize {
         self.holders.len()
     }
 
-    /// Waits for the next completed task in the set.
-    ///
-    /// Returns:
-    /// - `Some(Ok(T))` if a task completes successfully.
-    /// - `Some(Err(JoinError))` if a task was cancelled or panicked.
-    /// - `None` if the set is empty.
-    ///
-    /// Cancellation-safe: dropping the returned future does not remove tasks.
+    /// Wait for the next task to complete and return its result.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
         match self.join_set.join_next_with_id().await? {
             Ok((id, _)) => {
-                let holder = self.holders.remove(&id)?;
-                let output = holder.get_output().ok_or(JoinError::Cancelled);
-                Some(output)
+                let (_, output) = self.holders.remove(&id)?;
+                let output = unsafe { *Box::from_raw(output.as_ptr()) };
+                Some(output.ok_or(JoinError::Cancelled))
             }
             Err(error) => {
-                self.holders.remove(&error.id());
+                let (_, output) = self.holders.remove(&error.id())?;
+                unsafe { drop(Box::from_raw(output.as_ptr())) };
                 Some(Err(error.into()))
             }
         }
     }
 
-    /// Attempts to join one completed task without awaiting.
-    ///
-    /// Returns immediately with:
-    /// - `Some(Ok(T))` for a completed task,
-    /// - `Some(Err(JoinError))` for a cancelled or panicked task,
-    /// - `None` if no tasks have completed or the set is empty.
+    /// Non-async version of `join_next()`.
     pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
         match self.join_set.try_join_next_with_id()? {
             Ok((id, _)) => {
-                let holder = self.holders.remove(&id)?;
-                let output = holder.get_output().ok_or(JoinError::Cancelled);
-                Some(output)
+                let (_, output) = self.holders.remove(&id)?;
+                let output = unsafe { *Box::from_raw(output.as_ptr()) };
+                Some(output.ok_or(JoinError::Cancelled))
             }
             Err(error) => {
-                self.holders.remove(&error.id());
+                let (_, output) = self.holders.remove(&error.id())?;
+                unsafe { drop(Box::from_raw(output.as_ptr())) };
                 Some(Err(error.into()))
             }
         }
     }
 
-    /// Waits for all tasks to complete, consuming the set.
-    ///
-    /// Returns results in completion order. Cancellation-safe.
+    /// Wait for all tasks to complete.
     pub async fn join_all(mut self) -> Vec<Result<T, JoinError>> {
         let mut results = Vec::with_capacity(self.len());
-        while let Some(res) = self.join_next().await {
-            results.push(res);
+        while let Some(r) = self.join_next().await {
+            results.push(r);
         }
         results
     }
 
-    /// Aborts all currently-running tasks.
-    ///
-    /// Tasks remain in the set until they are completed or polled again.
+    /// Abort all running tasks.
     pub fn abort_all(&mut self) {
-        for holder in self.holders.values_mut() {
-            holder.abort();
+        for (handle, _) in self.holders.values_mut() {
+            handle.abort();
         }
     }
 
-    /// Aborts all tasks and waits for them to finish.
-    ///
-    /// Consumes the set and returns a list of results.
+    /// Abort all tasks and wait for their completion.
     pub async fn shutdown(mut self) -> Vec<Result<T, JoinError>> {
         self.abort_all();
         self.join_all().await
@@ -174,12 +182,38 @@ where
 
 unsafe impl<'scope, T: Send> Send for ScopedJoinSet<'scope, T> {}
 
-/// Errors returned when joining scoped tasks.
+impl<'scope, T> Drop for ScopedJoinSet<'scope, T>
+where
+    T: Send,
+{
+    fn drop(&mut self) {
+        if self.is_empty() {
+            return;
+        }
+
+        self.abort_all();
+
+        // Current-thread runtime must not block; deallocate eagerly.
+        if Handle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
+            self.holders.drain().for_each(|(_, (_, output))| {
+                unsafe { drop(Box::from_raw(output.as_ptr())) };
+            });
+        } else {
+            // Multi-threaded runtime: wait for abort completions.
+            block_in_place(|| {
+                while !self.is_empty() {
+                    self.try_join_next();
+                    spin_loop();
+                }
+            });
+        }
+    }
+}
+
+/// Errors returned by scoped tasks.
 #[derive(Debug)]
 pub enum JoinError {
-    /// Task was cancelled or aborted.
     Cancelled,
-    /// Task panicked; payload returned.
     Panicked(Box<dyn Any + Send + 'static>),
 }
 
@@ -195,12 +229,10 @@ impl fmt::Display for JoinError {
 impl Error for JoinError {}
 
 impl JoinError {
-    /// Returns true if the task was cancelled.
     pub fn is_cancelled(&self) -> bool {
         matches!(self, JoinError::Cancelled)
     }
 
-    /// Returns true if the task panicked.
     pub fn is_panic(&self) -> bool {
         matches!(self, JoinError::Panicked(_))
     }
