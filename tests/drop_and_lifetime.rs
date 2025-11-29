@@ -31,6 +31,8 @@ async fn task_drops_properly() {
     }
 
     assert_eq!(dropped.load(Ordering::SeqCst), 5);
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -44,6 +46,8 @@ async fn scope_lifetime_enforced() {
     let value = 99;
     let mut set = scoped_spawn(&value);
     assert!(matches!(set.join_next().await, Some(Ok(99))));
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -56,6 +60,6 @@ async fn none_on_dropped_future() {
         10
     });
 
-    drop(set);
+    set.shutdown().await;
     drop(tx);
 }

@@ -55,7 +55,7 @@ async fn dropping_set_while_tasks_pending() {
     }
 
     // Drop before they complete
-    drop(set);
+    set.shutdown().await;
 
     // All tasks should be dropped
     assert_eq!(drop_count.load(Ordering::SeqCst), count);
@@ -82,6 +82,8 @@ async fn interleaved_spawn_and_join() {
     }
 
     assert_eq!(count, 980);
+
+    set.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -106,4 +108,6 @@ async fn many_scoped_references() {
 
     results.sort();
     assert_eq!(results, values);
+
+    set.shutdown().await;
 }

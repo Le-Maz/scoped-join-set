@@ -35,6 +35,7 @@
 //!     while let Some(result) = set.join_next().await {
 //!         assert_eq!(result.unwrap(), *temporary_value);
 //!     }
+//!     set.shutdown().await;
 //! }
 //! ```
 //!
@@ -50,24 +51,36 @@
 //!    output slot.
 //! 5. `join_next()` converts that pointer back, reads the output, and frees
 //!    the allocation.
-//! 6. `Drop` aborts any remaining tasks and reclaims all leaked storage.
 //!
 //! No hashmaps or external bookkeeping structures are used—the pointer
 //! returned by each completed task uniquely identifies its output slot.  
 //! There is *no* self-referential struct and no dependence on pinning beyond
 //! ensuring that the wrapped future remains immovable.
+//!
+//! # Important: Explicit Shutdown Required
+//!
+//! A `ScopedJoinSet` **must be terminated explicitly** using either
+//!
+//! - [`ScopedJoinSet::shutdown()`], or
+//! - [`ScopedJoinSet::join_all()`],
+//!
+//! before it is dropped.
+//!
+//! Dropping a `ScopedJoinSet` implicitly (e.g., letting it go out of scope
+//! without calling one of the methods above) is considered a logic error.
+//!
+//! To prevent accidental misuse — which could otherwise cause tasks holding
+//! references into the stack to outlive their scope — the destructor prints an
+//! error message and **aborts the process**.
 
 mod future_wrappers;
 
 use crate::future_wrappers::{SendPtr, WriteOutput};
 use std::{
-    any::Any, error::Error, fmt, future::Future, hint::spin_loop, marker::PhantomData,
-    mem::MaybeUninit, ptr::NonNull,
+    any::Any, error::Error, fmt, future::Future, marker::PhantomData, mem::MaybeUninit,
+    process::abort, ptr::NonNull,
 };
-use tokio::{
-    runtime::{Handle, RuntimeFlavor},
-    task::{block_in_place, JoinSet},
-};
+use tokio::task::JoinSet;
 
 type TokioJoinError = tokio::task::JoinError;
 
@@ -83,6 +96,19 @@ type TokioJoinError = tokio::task::JoinError;
 /// used—the completed task returns a raw pointer identifying its output slot.
 ///
 /// Results are yielded in completion order.
+/// non-`'static` futures.
+///
+/// # Mandatory explicit shutdown
+///
+/// A `ScopedJoinSet` **must** be terminated using either
+/// [`ScopedJoinSet::shutdown()`] or [`ScopedJoinSet::join_all()`].
+///
+/// If dropped without having called one of these methods, the destructor
+/// prints an error message and **aborts the process** to prevent tasks from
+/// escaping the scope.
+///
+/// This rule ensures that tasks which borrow stack data never outlive that
+/// data.
 #[derive(Default)]
 pub struct ScopedJoinSet<'scope, T>
 where
@@ -90,6 +116,7 @@ where
 {
     join_set: JoinSet<SendPtr>,
     _marker: PhantomData<&'scope T>,
+    _safe_to_drop: bool,
 }
 
 impl<'scope, T> ScopedJoinSet<'scope, T>
@@ -101,6 +128,7 @@ where
         Self {
             join_set: JoinSet::new(),
             _marker: PhantomData,
+            _safe_to_drop: false,
         }
     }
 
@@ -172,6 +200,7 @@ where
         while let Some(r) = self.join_next().await {
             results.push(r);
         }
+        self._safe_to_drop = true;
         results
     }
 
@@ -198,28 +227,20 @@ impl<'scope, T> Drop for ScopedJoinSet<'scope, T>
 where
     T: Send,
 {
-    /// Drops the set, aborting all remaining tasks.
+    /// Drops the set.
     ///
-    /// Remaining output allocations are reclaimed as aborted task wrappers
-    /// are dropped.  
+    /// # Panics / Aborts
     ///
-    /// In a multi-threaded Tokio runtime this may block the thread until
-    /// abort notifications are processed.
+    /// A `ScopedJoinSet` **cannot** be dropped implicitly.  
+    /// If `.join_all()` or `.shutdown()` has not been called beforehand,
+    /// this destructor prints a diagnostic and **aborts the process**.
+    ///
+    /// This is a safety guarantee: tasks may borrow stack data, and allowing
+    /// implicit drop would risk those tasks outliving their scope.
     fn drop(&mut self) {
-        if self.is_empty() {
-            return;
-        }
-
-        self.abort_all();
-
-        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
-            // Multi-threaded runtime: wait for abort completions.
-            block_in_place(|| {
-                while !self.is_empty() {
-                    self.try_join_next();
-                    spin_loop();
-                }
-            });
+        if !self._safe_to_drop {
+            eprintln!("ScopedJoinSet cannot be dropped implicitly. Use `.join_all().await` or `.shutdown().await`.");
+            abort();
         }
     }
 }

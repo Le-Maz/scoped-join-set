@@ -16,6 +16,8 @@ async fn borrowed_struct_result() {
 
     let res = set.join_next().await.unwrap().unwrap();
     assert_eq!(*res.val, 123);
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -35,6 +37,8 @@ async fn multiple_borrowed_results() {
 
     results.sort();
     assert_eq!(results, vec![10, 20]);
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -62,6 +66,8 @@ async fn nested_borrow_result() {
 
     let res = set.join_next().await.unwrap().unwrap();
     assert_eq!(res.inner.slice, "nested");
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -84,4 +90,6 @@ async fn borrowed_and_owned_mixed() {
         results,
         vec![Cow::Borrowed("mixed"), Cow::Owned("owned".to_string()),]
     );
+
+    set.shutdown().await;
 }

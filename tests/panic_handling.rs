@@ -13,4 +13,6 @@ async fn panicking_task() {
         matches!(res, Some(Err(JoinError::Panicked(_)))),
         "Panicking task should return JoinError::Panicked"
     );
+
+    set.shutdown().await;
 }

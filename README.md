@@ -1,69 +1,54 @@
 # ScopedJoinSet
 
-A **lifetime-aware**, `&mut`-scoped wrapper around [`tokio::task::JoinSet`] that allows you to spawn **non-`'static` async tasks** safely.
+A **lifetime-aware**, `&mut`-scoped wrapper around [`tokio::task::JoinSet`] that allows you to spawn **non-`'static` futures** safely.
 
-`ScopedJoinSet` provides the ergonomic benefits of Tokio’s `JoinSet`, but lifts the `'static` bound on futures in a sound and predictable way. This enables async tasks that borrow stack-allocated data, while ensuring those tasks never outlive their parent scope.
+`ScopedJoinSet` is a drop-in, scope-bounded alternative to Tokio’s `JoinSet`. It enables async tasks that borrow data from the stack—without requiring cloning, `Arc`, or complicated ownership gymnastics—while guaranteeing the tasks cannot outlive the scope in which they were spawned.
+
+---
+
+## 🚨 Explicit Shutdown Required
+
+A `ScopedJoinSet` **must not be dropped implicitly**.  
+You **must** terminate it with **one** of:
+
+- `set.shutdown().await`, or
+- `set.join_all().await`.
+
+If dropped without calling either method:
+
+> **The process aborts.**
+
+This rule is essential for soundness: spawned tasks may borrow stack data, so implicit drop is forbidden to prevent them from outliving their scope.
 
 ---
 
 ## Why ScopedJoinSet?
 
-Tokio’s default task API requires all spawned futures to be `'static`. This makes many patterns impossible without cloning, `Arc`, or complex restructuring.
+Tokio requires all spawned futures to be `'static`.  
+This crate lifts that restriction:
 
-`ScopedJoinSet` enables:
+- spawn tasks that borrow local variables,
+- maintain predictable scope-bound lifetime,
+- avoid unnecessary `Arc` or cloning,
+- work entirely within safe Rust on the user side.
 
-* async tasks that borrow temporary variables,
-* task orchestration within a bounded scope,
-* predictable task lifetimes,
-* deterministic cleanup.
-
-All without unsafe user code.
+Scoped tasks behave like normal async tasks—just with lifetime guarantees.
 
 ---
 
 ## Key Guarantees
 
-Every task spawned through `ScopedJoinSet`:
+- Tasks may borrow from the stack (`'scope` is enforced by the API).
+- Each task is executed by Tokio but **cannot escape its scope**.
+- Result values are safely recovered in completion order.
+- Tasks are automatically cleaned up during `shutdown` or `join_all`.
+- Implicit drop is prohibited and enforced by an abort.
 
-* **cannot outlive** the data it captures (`'scope` is enforced at compile time),
-* **completes exactly once**, and its output is recoverable,
-* is **cancellation-safe** via `join_next`, `try_join_next`, or `shutdown`,
-* is **aborted and cleaned up** when the `ScopedJoinSet` is dropped.
-
-This crate does **not** spawn background tasks.
-Tasks always remain within the lifetime of the `ScopedJoinSet`.
+No background tasks. No `'static` requirement. No unsafe user code.
 
 ---
 
-## ⚠️ Recommendation: Prefer `shutdown().await`
-
-`ScopedJoinSet::shutdown()` allows all tasks to finish or abort **asynchronously**.
-
-If the `ScopedJoinSet` is dropped without shutdown:
-
-* all tasks are aborted immediately,
-* and the drop implementation uses a **spin loop (`block_in_place`)** on multithreaded runtimes to wait for completion.
-
-To avoid blocking executor threads, prefer:
-
-```rust
-set.shutdown().await;
-```
-
----
-
-## Features
-
-* Spawn futures with **non-`'static` lifetimes**.
-* Lightweight and predictable; no hashmaps or intrusive metadata.
-* **Cancellation-safe** joining.
-* `join_next()` and `try_join_next()` iterate tasks in completion order.
-* **Graceful or abrupt shutdown**.
-* Verified using Miri to hunt down UB or memory leakage.
-
----
-
-## Example
+## Quick Example
 
 ```rust
 use scoped_join_set::ScopedJoinSet;
@@ -83,36 +68,47 @@ async fn main() {
     while let Some(result) = set.join_next().await {
         assert_eq!(result.unwrap(), *value);
     }
+
+    // Required to avoid abort:
+    set.shutdown().await;
 }
 ```
 
-Tasks may borrow stack data safely because they cannot escape the scope of the `ScopedJoinSet`.
+---
+
+## Features
+
+- Spawn **non-`'static`** futures.
+- Deterministic scope-bounded lifetime.
+- `join_next()` + `try_join_next()` yield tasks in completion order.
+- Low overhead (no maps, indices, or intrusive metadata).
+- Soundness validated with Miri.
 
 ---
 
-## How It Works (Briefly)
+## How It Works (Overview)
 
-* Each task’s output is stored in a **heap-allocated slot**.
-* The user future is wrapped in a small pinned future that writes into that slot.
-* That wrapper is **unsafely cast to `'static`**, but this cast is sound because:
-  * the allocation outlives the task,
-  * the task cannot outlive the `ScopedJoinSet`,
-  * the wrapper future itself never moves once pinned.
-* `join_next()` retrieves the raw pointer returned by the task, reads the output, and frees the allocation.
+- Every task output lives in a unique heap allocation.
+- The user future is wrapped in a pinned future that writes to that slot.
+- The wrapper is unsafely promoted to `'static`, but soundly:
+  - the allocation outlives the task,
+  - tasks cannot outlive the `ScopedJoinSet`,
+  - the wrapper future never moves after being pinned.
+- The completed task returns a raw pointer identifying its output slot.
+- `join_next()` reads the value and frees the allocation.
 
-This design keeps the overhead low — typically **within ~5–7%** of Tokio’s native `JoinSet`.
-
-A more detailed explanation lives in the crate docs.
+Simple, fast, and predictable.
 
 ---
 
-## Comparison to Tokio’s `JoinSet`
+## Comparison with Tokio’s JoinSet
 
-| Feature                    | Tokio `JoinSet` | Scoped `JoinSet` |
-| -------------------------- | --------------- | ---------------- |
-| Requires `'static` futures | ✅ Yes           | ❌ No             |
-| Allows stack borrows       | ❌ No            | ✅ Yes            |
-| Deterministic scope-bound  | ❌ No            | ✅ Yes            |
+| Feature                    | Tokio `JoinSet` | ScopedJoinSet |
+| -------------------------- | --------------- | ------------- |
+| Spawn non-`'static` tasks  | ❌ No           | ✅ Yes        |
+| Borrows from stack allowed | ❌ No           | ✅ Yes        |
+| Scoped lifetime enforced   | ❌ No           | ✅ Yes        |
+| Implicit drop safe         | ✅ Yes          | ❌ Aborts     |
 
 ---
 
@@ -120,32 +116,26 @@ A more detailed explanation lives in the crate docs.
 
 ```toml
 [dependencies]
-scoped-join-set = "0.6"
+scoped-join-set = "0.7"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ---
 
-## Soundness
+## Soundness Notes
 
-`ScopedJoinSet` relies on `unsafe` internally, but:
+This crate uses `unsafe` internally but:
 
-* all pinned wrappers have stable addresses,
-* tasks cannot escape the scope through the API,
-* all allocations are freed after task completion or abortion,
-* Miri runs show no UB.
+- all wrapper futures are pinned and immovable,
+- no task can escape the scope (API prevents it),
+- all allocations are freed once tasks finish or abort,
+- extensive testing + Miri runs have found no UB.
 
-Still, this crate has **not** been extensively audited.
-See the warning below.
+However:
 
----
+> **The crate has not undergone formal third-party audit.**
 
-## ⚠️ Warning
-
-This crate has **not undergone formal peer review or production-level verification**.
-It is tested for memory safety (including Miri), but use in security-critical or untrusted contexts carries risk.
-
-Please **test thoroughly** in your environment before deploying.
+Use in critical contexts at your discretion.
 
 ---
 

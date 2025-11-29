@@ -10,8 +10,8 @@ use scoped_join_set::ScopedJoinSet;
 #[tokio::test(flavor = "multi_thread")]
 async fn long_poll() {
     let local_variable = "local variable".to_string();
-    let mut scoped_join_set = ScopedJoinSet::new();
-    scoped_join_set.spawn(async {
+    let mut set = ScopedJoinSet::new();
+    set.spawn(async {
         poll_fn(|_| {
             let reference = &local_variable;
             sleep(Duration::from_millis(100));
@@ -19,14 +19,14 @@ async fn long_poll() {
         })
         .await;
     });
-    drop(scoped_join_set);
+    set.shutdown().await;
     drop(local_variable);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn special_drop() {
     let local_variable = "local variable".to_string();
-    let mut scoped_join_set = ScopedJoinSet::new();
+    let mut set = ScopedJoinSet::new();
 
     struct SpecialDrop<'a> {
         reference: &'a str,
@@ -54,12 +54,12 @@ async fn special_drop() {
         }
     }
 
-    scoped_join_set.spawn(async {
+    set.spawn(async {
         let f = SpecialDrop::new(&local_variable);
         tokio::time::sleep(Duration::from_millis(20)).await;
         f.await;
     });
 
-    drop(scoped_join_set);
+    set.shutdown().await;
     drop(local_variable);
 }

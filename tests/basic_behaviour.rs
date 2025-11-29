@@ -20,6 +20,8 @@ async fn basic_completion() {
 
     results.sort();
     assert_eq!(results, vec![1, 2]);
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -27,6 +29,8 @@ async fn join_next_returns_none_when_empty() {
     let mut set: ScopedJoinSet<i32> = ScopedJoinSet::new();
 
     assert!(set.join_next().await.is_none());
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -37,6 +41,8 @@ async fn len_and_spawn() {
     set.spawn(async { 1 });
     set.spawn(async { 2 });
     assert_eq!(set.len(), 2);
+
+    set.shutdown().await;
 }
 
 #[tokio::test]
@@ -61,4 +67,6 @@ async fn try_join_next_non_blocking() {
     // Now try_join_next should return the result
     let res = set.try_join_next();
     assert!(matches!(res, Some(Ok(42))));
+
+    set.shutdown().await;
 }

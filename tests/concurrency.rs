@@ -29,4 +29,6 @@ async fn tasks_run_concurrently() {
     }
 
     assert_eq!(finished.load(Ordering::SeqCst), 3);
+
+    set.shutdown().await;
 }

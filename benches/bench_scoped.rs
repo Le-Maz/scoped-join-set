@@ -28,6 +28,8 @@ fn spawn_regular_tasks(b: &mut Bencher) {
                 results.push(res.unwrap());
             }
 
+            set.shutdown().await;
+
             results
         });
     });
@@ -51,6 +53,8 @@ fn use_shared_state(b: &mut Bencher) {
             while let Some(res) = set.join_next().await {
                 res.unwrap();
             }
+
+            set.shutdown().await;
 
             counter.load(Ordering::Relaxed)
         });
