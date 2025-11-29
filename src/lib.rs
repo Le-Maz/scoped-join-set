@@ -6,11 +6,11 @@
 //! Tokio requires all spawned tasks to be `'static`. `ScopedJoinSet` lifts
 //! this restriction by:
 //!
-//! - allocating each user future on the heap,
-//! - pinning it so it never moves,
-//! - unsafely casting it to `'static` (valid because the allocation is
-//!   retained until the task completes),
-//! - storing the task's output in `Box<Option<T>>`,
+//! - allocating each user future and its output slot on the heap,
+//! - pinning the wrapper future so it never moves,
+//! - unsafely casting it to `'static` (sound because the allocation is kept
+//!   alive until the task completes),
+//! - storing each task’s output in `Box<Option<T>>`,
 //! - retrieving and deallocating that output when the task completes.
 //!
 //! This lets users write:
@@ -42,46 +42,55 @@
 //!
 //! # How it works internally
 //!
-//! 1. `spawn()` allocates a `Box<Option<T>>` for the result and leaks it.
+//! 1. `spawn()` allocates a `Box<MaybeUninit<T>>` for the result and leaks it.
 //! 2. The user future is wrapped in `WriteOutput`, which writes its output
-//!    into this storage.
+//!    into this slot.
 //! 3. The wrapper future is pinned and unsafely converted to `'static`.
-//! 4. Tokio polls the wrapper; `ScopedJoinSet` tracks the task ID and the
-//!    output pointer.
-//! 5. `join_next()` retrieves and deallocates the result.
-//! 6. `Drop` aborts all active tasks and reclaims leaked storage.
+//! 4. Tokio polls the wrapper and returns a raw pointer identifying the
+//!    output slot.
+//! 5. `join_next()` converts that pointer back, reads the output, and frees
+//!    the allocation.
+//! 6. `Drop` aborts any remaining tasks and reclaims all leaked storage.
 //!
+//! No hashmaps or external bookkeeping structures are used—the pointer
+//! returned by each completed task uniquely identifies its output slot.  
 //! There is *no* self-referential struct and no dependence on pinning beyond
-//! guaranteeing that the wrapped future remains immovable.
+//! ensuring that the wrapped future remains immovable.
 
 #![feature(ptr_metadata)]
 
 mod future_wrappers;
 
-use crate::future_wrappers::WriteOutput;
+use crate::future_wrappers::{SendPtr, WriteOutput};
 use std::{
-    any::Any, collections::HashMap, error::Error, fmt, future::Future, hint::spin_loop,
-    marker::PhantomData, ptr::NonNull,
+    any::Any, error::Error, fmt, future::Future, hint::spin_loop, marker::PhantomData,
+    mem::MaybeUninit, ptr::NonNull,
 };
 use tokio::{
     runtime::{Handle, RuntimeFlavor},
-    task::{block_in_place, AbortHandle, Id, JoinSet},
+    task::{block_in_place, JoinSet},
 };
 
 type TokioJoinError = tokio::task::JoinError;
 
-/// A scoped task set analogous to [`tokio::task::JoinSet`] but requiring
-/// only `'scope` instead of `'static` futures.
+/// A scoped task set analogous to [`tokio::task::JoinSet`] but accepting
+/// non-`'static` futures.
 ///
-/// All tasks produce an output of type `T`. Results are returned in
-/// completion order by `join_next()` and related methods.
+/// `ScopedJoinSet` allows spawning futures that borrow data with lifetime
+/// `'scope`, while still being executed by Tokio, which normally requires
+/// `'static` futures.  
+///
+/// Each task’s result is written into a dedicated heap allocation and later
+/// recovered by `join_next()`. No maps, arenas, or auxiliary structures are
+/// used—the completed task returns a raw pointer identifying its output slot.
+///
+/// Results are yielded in completion order.
 #[derive(Default)]
 pub struct ScopedJoinSet<'scope, T>
 where
     T: 'scope + Send,
 {
-    join_set: JoinSet<()>,
-    holders: HashMap<Id, (AbortHandle, NonNull<Option<T>>)>,
+    join_set: JoinSet<SendPtr>,
     _marker: PhantomData<&'scope T>,
 }
 
@@ -93,26 +102,28 @@ where
     pub fn new() -> Self {
         Self {
             join_set: JoinSet::new(),
-            holders: HashMap::new(),
             _marker: PhantomData,
         }
     }
 
-    /// Spawn a non-`'static` future into the set.
+    /// Spawns a non-`'static` future into the set.
+    ///
+    /// The future's output is written into a heap-allocated slot owned by the
+    /// set. The future itself is wrapped and safely promoted to `'static`
+    /// because `ScopedJoinSet` guarantees that its allocation outlives the task.
     pub fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = T> + Send + 'scope,
         T: Send,
     {
         // Allocate output slot.
-        let output = Box::leak(Box::new(None)).into();
+        let output: NonNull<MaybeUninit<T>> = Box::leak(Box::new(MaybeUninit::uninit())).into();
 
         // Wrap + convert to 'static future.
-        let task = WriteOutput::new(task, output);
+        let task = WriteOutput::new(task, output.cast());
         let task = unsafe { task.into_static() };
 
-        let handle = self.join_set.spawn(task);
-        self.holders.insert(handle.id(), (handle, output));
+        self.join_set.spawn(task);
     }
 
     /// Returns `true` if no tasks remain.
@@ -122,42 +133,42 @@ where
 
     /// Returns the number of active tasks.
     pub fn len(&self) -> usize {
-        self.holders.len()
+        self.join_set.len()
     }
 
-    /// Wait for the next task to complete and return its result.
+    /// Waits for the next task to complete and returns its result.
+    ///
+    /// On success, returns the output value produced by the task.  
+    /// On failure, returns a [`JoinError`].  
+    ///
+    /// The associated output allocation is reclaimed automatically.
     pub async fn join_next(&mut self) -> Option<Result<T, JoinError>> {
-        match self.join_set.join_next_with_id().await? {
-            Ok((id, _)) => {
-                let (_, output) = self.holders.remove(&id)?;
+        match self.join_set.join_next().await? {
+            Ok(output) => {
+                let output: NonNull<T> = output.cast();
                 let output = unsafe { *Box::from_raw(output.as_ptr()) };
-                Some(output.ok_or(JoinError::Cancelled))
+                Some(Ok(output))
             }
-            Err(error) => {
-                let (_, output) = self.holders.remove(&error.id())?;
-                unsafe { drop(Box::from_raw(output.as_ptr())) };
-                Some(Err(error.into()))
-            }
+            Err(error) => Some(Err(error.into())),
         }
     }
 
-    /// Non-async version of `join_next()`.
+    /// Non-async version of [`join_next`].
+    ///
+    /// Returns immediately if no task has finished polling.
     pub fn try_join_next(&mut self) -> Option<Result<T, JoinError>> {
-        match self.join_set.try_join_next_with_id()? {
-            Ok((id, _)) => {
-                let (_, output) = self.holders.remove(&id)?;
+        match self.join_set.try_join_next()? {
+            Ok(output) => {
+                let output: NonNull<T> = output.cast();
                 let output = unsafe { *Box::from_raw(output.as_ptr()) };
-                Some(output.ok_or(JoinError::Cancelled))
+                Some(Ok(output))
             }
-            Err(error) => {
-                let (_, output) = self.holders.remove(&error.id())?;
-                unsafe { drop(Box::from_raw(output.as_ptr())) };
-                Some(Err(error.into()))
-            }
+            Err(error) => Some(Err(error.into())),
         }
     }
 
-    /// Wait for all tasks to complete.
+    /// Waits for the completion of all tasks and returns their results in
+    /// completion order.
     pub async fn join_all(mut self) -> Vec<Result<T, JoinError>> {
         let mut results = Vec::with_capacity(self.len());
         while let Some(r) = self.join_next().await {
@@ -166,14 +177,17 @@ where
         results
     }
 
-    /// Abort all running tasks.
+    /// Aborts all running tasks.
+    ///
+    /// Any output slots associated with incomplete tasks are cleaned up
+    /// when the task wrapper is dropped.
     pub fn abort_all(&mut self) {
-        for (handle, _) in self.holders.values_mut() {
-            handle.abort();
-        }
+        self.join_set.abort_all();
     }
 
-    /// Abort all tasks and wait for their completion.
+    /// Aborts all tasks and then waits for them to finish.
+    ///
+    /// Returns results for tasks that completed before the abort took effect.
     pub async fn shutdown(mut self) -> Vec<Result<T, JoinError>> {
         self.abort_all();
         self.join_all().await
@@ -186,6 +200,13 @@ impl<'scope, T> Drop for ScopedJoinSet<'scope, T>
 where
     T: Send,
 {
+    /// Drops the set, aborting all remaining tasks.
+    ///
+    /// Remaining output allocations are reclaimed as aborted task wrappers
+    /// are dropped.  
+    ///
+    /// In a multi-threaded Tokio runtime this may block the thread until
+    /// abort notifications are processed.
     fn drop(&mut self) {
         if self.is_empty() {
             return;
@@ -193,12 +214,7 @@ where
 
         self.abort_all();
 
-        // Current-thread runtime must not block; deallocate eagerly.
-        if Handle::current().runtime_flavor() == RuntimeFlavor::CurrentThread {
-            self.holders.drain().for_each(|(_, (_, output))| {
-                unsafe { drop(Box::from_raw(output.as_ptr())) };
-            });
-        } else {
+        if Handle::current().runtime_flavor() == RuntimeFlavor::MultiThread {
             // Multi-threaded runtime: wait for abort completions.
             block_in_place(|| {
                 while !self.is_empty() {
@@ -211,6 +227,9 @@ where
 }
 
 /// Errors returned by scoped tasks.
+///
+/// A task may be cancelled (e.g., via `abort_all`) or may panic.
+/// Both cases are detected and surfaced by `ScopedJoinSet`.
 #[derive(Debug)]
 pub enum JoinError {
     Cancelled,

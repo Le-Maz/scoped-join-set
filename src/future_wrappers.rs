@@ -4,41 +4,91 @@
 //!
 //! # Overview
 //!
-//! `WriteOutput<F, T>` wraps a user future `F: Future<Output = T>` and stores
-//! its output in a heap-allocated `Option<T>` instead of returning it
+//! `WriteOutput<F, T>` wraps a user future `F: Future<Output = T>` and writes
+//! its output into a caller-provided heap allocation rather than returning it
 //! directly.  
 //!
-//! The wrapper future always returns `()` — the result is written into the
-//! provided pointer and later extracted by `ScopedJoinSet`.
+//! The wrapper future itself always returns a `SendPtr`, which is simply a
+//! raw non-null pointer identifying the output slot. `ScopedJoinSet` uses
+//! this pointer to recover and deallocate the stored result after the task
+//! completes.
 //!
 //! # Why this is needed
 //!
-//! Tokio requires all spawned tasks to be `'static`.  
-//! `ScopedJoinSet` accepts futures with any lifetime `'scope`.  
+//! Tokio only allows spawning `'static` futures.  
+//! `ScopedJoinSet` accepts futures with arbitrary lifetimes `'scope`.
 //!
-//! To make this work safely:
+//! To bridge this safely without extra bookkeeping structures:
 //!
-//! - The user future is moved into a pinned `Box`, ensuring it never moves.
-//! - We unsafely cast that pinned box to `'static`. This is valid because
-//!   `ScopedJoinSet` guarantees that the boxed allocation lives until after
-//!   the future completes or is aborted.
-//! - The future writes its output into `Box<Option<T>>`, which the join
-//!   logic takes ownership of.
+//! - The user future is wrapped and placed in a pinned `Box`, ensuring it
+//!   never moves in memory.
+//! - This pinned box is unsafely cast to `'static`; this is sound because
+//!   `ScopedJoinSet` guarantees that the allocation outlives the spawned
+//!   task.
+//! - The wrapper writes the future's output into a dedicated heap
+//!   allocation owned by the caller.
+//! - The wrapper returns a raw pointer to that storage. No hashmap or
+//!   external indexing is needed: the pointer itself uniquely identifies
+//!   the result slot.
+//! - After the task completes, `ScopedJoinSet` reads the output from that
+//!   pointer and frees the allocation.
 //!
-//! This gives `'static` pollability without `'static` user requirements.
+//! This provides `'static` pollability without requiring `'static` user
+//! futures and without maintaining any auxiliary data structures.
 
 use std::{
     future::Future,
+    ops::Deref,
     pin::Pin,
     ptr::NonNull,
     task::{ready, Context, Poll},
 };
 
-/// Wraps a user future and stores its output in heap storage instead of
-/// returning it directly.
-pub struct WriteOutput<F, T> {
+/// A `Send`-safe wrapper around a non-null raw pointer.
+///
+/// This is used as the `Output` type of a wrapped task. Each completed task
+/// returns a `SendPtr` identifying the heap slot containing its output.
+///
+/// The pointer uniquely identifies the result and no additional lookup
+/// structures are required.
+#[repr(transparent)]
+pub(crate) struct SendPtr {
+    inner: NonNull<u8>,
+}
+
+impl Deref for SendPtr {
+    type Target = NonNull<u8>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl SendPtr {
+    /// Creates a new `SendPtr` from a non-null pointer.
+    #[inline]
+    fn new(inner: NonNull<u8>) -> Self {
+        Self { inner }
+    }
+}
+
+unsafe impl Send for SendPtr {}
+
+/// Wraps a user future so it can be spawned as `'static` while still
+/// producing a non-`'static` result.
+///
+/// The wrapper:
+/// - polls the user future,
+/// - writes its output into the provided heap slot,
+/// - returns a raw pointer (`SendPtr`) identifying that slot.
+///
+/// If the future is dropped before completing (e.g., due to task abortion),
+/// the wrapper deallocates the unused slot.
+pub(crate) struct WriteOutput<F, T> {
     future: F,
-    output_ptr: NonNull<Option<T>>,
+    output_ptr: NonNull<T>,
+    success: bool,
 }
 
 unsafe impl<F, T> Send for WriteOutput<F, T> {}
@@ -48,25 +98,31 @@ where
     F: Future<Output = T> + Send + 'scope,
     T: 'scope,
 {
-    /// Create a new wrapper around the user future, paired with an output
-    /// storage pointer.
-    pub fn new(future: F, output_ptr: NonNull<Option<T>>) -> Self {
-        Self { future, output_ptr }
+    /// Creates a new wrapper over the given future and output pointer.
+    ///
+    /// `output_ptr` must point to a valid, writable heap allocation that will
+    /// outlive the spawned task.
+    #[inline]
+    pub fn new(future: F, output_ptr: NonNull<T>) -> Self {
+        Self {
+            future,
+            output_ptr,
+            success: false,
+        }
     }
 
-    /// Converts this wrapper future into a `'static` future so Tokio can spawn it.
+    /// Converts this wrapper into a `'static` future so that Tokio can spawn it.
     ///
-    /// SAFETY: This is safe in the context of `ScopedJoinSet` only if:
-    /// - the boxed allocation containing the future lives for the duration
-    ///   of the spawned task.
-    /// - no references inside the future outlive `'scope`.
+    /// # Safety
     ///
-    /// `ScopedJoinSet` guarantees these properties.
-    pub unsafe fn into_static(self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    /// Safe only when the allocation containing the wrapper is guaranteed to
+    /// outlive the spawned task. `ScopedJoinSet` enforces this property.
+    #[inline]
+    pub unsafe fn into_static(self) -> Pin<Box<dyn Future<Output = SendPtr> + Send>> {
         unsafe {
             std::mem::transmute::<
-                Pin<Box<dyn Future<Output = ()> + Send + 'scope>>,
-                Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+                Pin<Box<dyn Future<Output = SendPtr> + Send + 'scope>>,
+                Pin<Box<dyn Future<Output = SendPtr> + Send + 'static>>,
             >(Box::pin(self))
         }
     }
@@ -76,14 +132,34 @@ impl<F, T> Future for WriteOutput<F, T>
 where
     F: Future<Output = T>,
 {
-    type Output = ();
+    type Output = SendPtr;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    /// Polls the wrapped future. When it completes:
+    /// - writes its output into the heap slot,
+    /// - marks the wrapper as successfully completed,
+    /// - returns a pointer identifying the output slot.
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<SendPtr> {
         let this = unsafe { self.get_unchecked_mut() };
         let fut = unsafe { Pin::new_unchecked(&mut this.future) };
 
         let output = ready!(fut.poll(cx));
-        unsafe { this.output_ptr.write(Some(output)) };
-        Poll::Ready(())
+        unsafe { this.output_ptr.write(output) };
+        this.success = true;
+
+        Poll::Ready(SendPtr::new(this.output_ptr.cast()))
+    }
+}
+
+impl<F, T> Drop for WriteOutput<F, T> {
+    /// On drop, if the user future never completed, the associated heap output
+    /// allocation is reclaimed.
+    ///
+    /// This ensures that aborted tasks do not leak memory.
+    #[inline]
+    fn drop(&mut self) {
+        if !self.success {
+            unsafe { drop(Box::from_raw(self.output_ptr.as_ptr())) };
+        }
     }
 }
