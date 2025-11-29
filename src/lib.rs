@@ -57,8 +57,6 @@
 //! There is *no* self-referential struct and no dependence on pinning beyond
 //! ensuring that the wrapped future remains immovable.
 
-#![feature(ptr_metadata)]
-
 mod future_wrappers;
 
 use crate::future_wrappers::{SendPtr, WriteOutput};
