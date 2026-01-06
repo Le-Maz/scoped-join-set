@@ -38,6 +38,7 @@
 
 use std::{
     future::Future,
+    mem::MaybeUninit,
     ops::Deref,
     pin::Pin,
     ptr::NonNull,
@@ -100,7 +101,7 @@ pub(crate) struct WriteOutput<FutureType, TaskOutput> {
     /// The actual future provided by the user to be polled.
     future: FutureType,
     /// A pointer to the heap location where the result should be written.
-    output_ptr: NonNull<TaskOutput>,
+    output_ptr: NonNull<MaybeUninit<TaskOutput>>,
     /// Tracks whether the future completed successfully to handle cleanup on drop.
     success: bool,
 }
@@ -126,7 +127,7 @@ where
     /// that `output_ptr` is valid and that the resulting `WriteOutput` is
     /// managed correctly to prevent memory leaks or use-after-free errors.
     #[inline]
-    pub(crate) unsafe fn new(future: FutureType, output_ptr: NonNull<TaskOutput>) -> Self {
+    pub(crate) unsafe fn new(future: FutureType, output_ptr: NonNull<MaybeUninit<TaskOutput>>) -> Self {
         Self {
             future,
             output_ptr,
@@ -168,7 +169,7 @@ where
         let future_pinned = unsafe { Pin::new_unchecked(&mut this.future) };
 
         let output = ready!(future_pinned.poll(context));
-        unsafe { this.output_ptr.write(output) };
+        unsafe { this.output_ptr.as_mut().write(output) };
         this.success = true;
 
         Poll::Ready(unsafe { SendPtr::new(this.output_ptr.cast()) })
@@ -183,6 +184,8 @@ impl<FutureType, TaskOutput> Drop for WriteOutput<FutureType, TaskOutput> {
     #[inline]
     fn drop(&mut self) {
         if !self.success {
+            // Reclaim the box as MaybeUninit, which drops the allocation
+            // WITHOUT dropping the inner (uninitialized) value.
             unsafe { drop(Box::from_raw(self.output_ptr.as_ptr())) };
         }
     }

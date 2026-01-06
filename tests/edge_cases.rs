@@ -67,3 +67,19 @@ async fn drop_panic() {
 
     drop(local_variable);
 }
+
+#[tokio::test]
+async fn drop_uninit_memory_crash() {
+    // A String requires valid internal pointers.
+    // If we drop a String residing in uninitialized memory, it frees garbage.
+    scope::<String, _, _>(async |s| {
+        s.spawn(async {
+            // Sleep to ensure we are aborted before writing the result
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            "Valid String".to_string()
+        });
+
+        // Abort immediately, triggering WriteOutput::drop on the uninit slot
+        s.abort_all();
+    }).await;
+}
