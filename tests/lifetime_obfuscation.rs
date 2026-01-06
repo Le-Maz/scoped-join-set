@@ -1,6 +1,5 @@
 use std::borrow::Cow;
-
-use scoped_join_set::ScopedJoinSet;
+use scoped_join_set::scope;
 
 #[tokio::test]
 async fn borrowed_struct_result() {
@@ -10,14 +9,13 @@ async fn borrowed_struct_result() {
     }
 
     let num = 123;
-    let mut set = ScopedJoinSet::new();
+    
+    scope(async |s| {
+        s.spawn(async { Borrowed { val: &num } }).await;
 
-    set.spawn(async { Borrowed { val: &num } });
-
-    let res = set.join_next().await.unwrap().unwrap();
-    assert_eq!(*res.val, 123);
-
-    set.shutdown().await;
+        let res = s.join_next().await.unwrap().unwrap();
+        assert_eq!(*res.val, 123);
+    }).await;
 }
 
 #[tokio::test]
@@ -25,20 +23,18 @@ async fn multiple_borrowed_results() {
     let a = 10;
     let b = 20;
 
-    let mut set = ScopedJoinSet::new();
+    scope(async |s| {
+        s.spawn(async { &a }).await;
+        s.spawn(async { &b }).await;
 
-    set.spawn(async { &a });
-    set.spawn(async { &b });
+        let mut results = vec![];
+        while let Some(res) = s.join_next().await {
+            results.push(*res.unwrap());
+        }
 
-    let mut results = vec![];
-    while let Some(res) = set.join_next().await {
-        results.push(*res.unwrap());
-    }
-
-    results.sort();
-    assert_eq!(results, vec![10, 20]);
-
-    set.shutdown().await;
+        results.sort();
+        assert_eq!(results, vec![10, 20]);
+    }).await;
 }
 
 #[tokio::test]
@@ -56,18 +52,16 @@ async fn nested_borrow_result() {
     let data = String::from("nested borrow");
     let slice = &data[0..6];
 
-    let mut set = ScopedJoinSet::new();
+    scope(async |s| {
+        s.spawn(async {
+            Outer {
+                inner: Inner { slice },
+            }
+        }).await;
 
-    set.spawn(async {
-        Outer {
-            inner: Inner { slice },
-        }
-    });
-
-    let res = set.join_next().await.unwrap().unwrap();
-    assert_eq!(res.inner.slice, "nested");
-
-    set.shutdown().await;
+        let res = s.join_next().await.unwrap().unwrap();
+        assert_eq!(res.inner.slice, "nested");
+    }).await;
 }
 
 #[tokio::test]
@@ -75,21 +69,20 @@ async fn borrowed_and_owned_mixed() {
     let text = String::from("mixed");
     let slice: &str = &text;
 
-    let mut set = ScopedJoinSet::new();
-    set.spawn(async { Cow::Borrowed(slice) });
-    set.spawn(async { Cow::Owned("owned".to_string()) });
+    scope(async |s| {
+        s.spawn(async { Cow::Borrowed(slice) }).await;
+        s.spawn(async { Cow::Owned("owned".to_string()) }).await;
 
-    let mut results = vec![];
-    while let Some(result) = set.join_next().await {
-        results.push(result.unwrap());
-    }
+        let mut results = vec![];
+        while let Some(result) = s.join_next().await {
+            results.push(result.unwrap());
+        }
 
-    results.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        results.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
 
-    assert_eq!(
-        results,
-        vec![Cow::Borrowed("mixed"), Cow::Owned("owned".to_string()),]
-    );
-
-    set.shutdown().await;
+        assert_eq!(
+            results,
+            vec![Cow::Borrowed("mixed"), Cow::Owned("owned".to_string()),]
+        );
+    }).await;
 }

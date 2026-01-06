@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
 };
 
-use scoped_join_set::ScopedJoinSet;
+use scoped_join_set::scope;
 use tokio::sync::oneshot;
 
 #[tokio::test]
@@ -17,49 +17,53 @@ async fn task_drops_properly() {
         }
     }
 
-    let mut set = ScopedJoinSet::new();
-    for _ in 0..5 {
-        let drop_counter = DropCounter(dropped.clone());
-        set.spawn(async move {
-            drop(drop_counter);
-            42
-        });
-    }
+    scope::<(), _, _>(async |s| {
+        for _ in 0..5 {
+            let drop_counter = DropCounter(dropped.clone());
+            s.spawn(async move {
+                drop(drop_counter);
+            })
+            .await;
+        }
 
-    while !set.is_empty() {
-        set.join_next().await;
-    }
+        while !s.is_empty().await {
+            s.join_next().await;
+        }
+    })
+    .await;
 
     assert_eq!(dropped.load(Ordering::SeqCst), 5);
-
-    set.shutdown().await;
 }
 
 #[tokio::test]
 async fn scope_lifetime_enforced() {
-    fn scoped_spawn<'a>(val: &'a i32) -> ScopedJoinSet<'a, i32> {
-        let mut set = ScopedJoinSet::new();
-        set.spawn(async move { *val });
-        set
-    }
-
     let value = 99;
-    let mut set = scoped_spawn(&value);
-    assert!(matches!(set.join_next().await, Some(Ok(99))));
 
-    set.shutdown().await;
+    // The previous test helper `scoped_spawn` is replaced by the direct usage of `scope`.
+    // The compiler enforces that `value` outlives the closure.
+    scope::<i32, _, _>(async |s| {
+        s.spawn(async { value }).await;
+
+        assert!(matches!(s.join_next().await, Some(Ok(99))));
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn none_on_dropped_future() {
-    let mut set = ScopedJoinSet::new();
     let (tx, rx) = oneshot::channel::<()>();
 
-    set.spawn(async move {
-        let _ = rx.await;
-        10
-    });
+    scope::<i32, _, _>(async move |s| {
+        s.spawn(async move {
+            let _ = rx.await;
+            10
+        })
+        .await;
 
-    set.shutdown().await;
+        // We exit the scope, triggering implicit abort/join of the task.
+    })
+    .await;
+
+    // Verify tx was dropped (channel closed) without receiving a result
     drop(tx);
 }

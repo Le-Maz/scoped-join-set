@@ -1,18 +1,18 @@
-use scoped_join_set::{JoinError, ScopedJoinSet};
+use scoped_join_set::{scope, JoinError};
 
 #[tokio::test]
 async fn panicking_task() {
-    let mut set = ScopedJoinSet::new();
+    scope::<(), _, _>(async |s| {
+        s.spawn(async {
+            panic!("test panic");
+        })
+        .await;
 
-    set.spawn(async {
-        panic!("test panic");
-    });
-
-    let res = set.join_next().await;
-    assert!(
-        matches!(res, Some(Err(JoinError::Panicked(_)))),
-        "Panicking task should return JoinError::Panicked"
-    );
-
-    set.shutdown().await;
+        let res = s.join_next().await;
+        assert!(
+            matches!(res, Some(Err(JoinError::Panicked(_)))),
+            "Panicking task should return JoinError::Panicked"
+        );
+    })
+    .await;
 }

@@ -1,32 +1,35 @@
 use std::{
     future::{poll_fn, Future},
     task::Poll,
-    thread::sleep,
+    thread::sleep as thread_sleep,
     time::Duration,
 };
 
-use scoped_join_set::ScopedJoinSet;
+use scoped_join_set::scope;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn long_poll() {
     let local_variable = "local variable".to_string();
-    let mut set = ScopedJoinSet::new();
-    set.spawn(async {
-        poll_fn(|_| {
-            let reference = &local_variable;
-            sleep(Duration::from_millis(100));
-            Poll::Ready(reference.clone())
+
+    scope::<(), _, _>(async |s| {
+        s.spawn(async {
+            poll_fn(|_| {
+                let reference = &local_variable;
+                thread_sleep(Duration::from_millis(100));
+                Poll::Ready(reference.clone())
+            })
+            .await;
         })
         .await;
-    });
-    set.shutdown().await;
+    })
+    .await;
+
     drop(local_variable);
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn special_drop() {
     let local_variable = "local variable".to_string();
-    let mut set = ScopedJoinSet::new();
 
     struct SpecialDrop<'a> {
         reference: &'a str,
@@ -54,12 +57,15 @@ async fn special_drop() {
         }
     }
 
-    set.spawn(async {
-        let f = SpecialDrop::new(&local_variable);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        f.await;
-    });
+    scope::<(), _, _>(async |s| {
+        s.spawn(async {
+            let f = SpecialDrop::new(&local_variable);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            f.await;
+        })
+        .await;
+    })
+    .await;
 
-    set.shutdown().await;
     drop(local_variable);
 }

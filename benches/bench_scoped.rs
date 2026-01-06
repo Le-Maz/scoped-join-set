@@ -2,7 +2,7 @@
 
 extern crate test;
 
-use scoped_join_set::ScopedJoinSet;
+use scoped_join_set::scope;
 use std::{
     hint::black_box,
     sync::atomic::{AtomicUsize, Ordering},
@@ -17,20 +17,22 @@ fn spawn_regular_tasks(b: &mut Bencher) {
     let rt = Runtime::new().unwrap();
     b.iter(|| {
         rt.block_on(async {
-            let mut set = ScopedJoinSet::<usize>::new();
+            scope(async |s| {
+                for i in 0..TASKS {
+                    // s.spawn is now async
+                    black_box(s.spawn(async move { i * 2 }).await);
+                }
 
-            for i in 0..TASKS {
-                black_box(set.spawn(async move { i * 2 }));
-            }
+                let mut results = Vec::with_capacity(TASKS);
+                while !s.is_empty().await {
+                    if let Some(Ok(res)) = s.join_next().await {
+                        results.push(res);
+                    }
+                }
 
-            let mut results = Vec::with_capacity(TASKS);
-            while let Some(res) = set.join_next().await {
-                results.push(res.unwrap());
-            }
-
-            set.shutdown().await;
-
-            results
+                results
+            })
+            .await
         });
     });
 }
@@ -41,20 +43,21 @@ fn use_shared_state(b: &mut Bencher) {
     b.iter(|| {
         rt.block_on(async {
             let counter = AtomicUsize::new(0);
-            let mut set = ScopedJoinSet::new();
 
-            for _ in 0..TASKS {
-                let c_ref = &counter;
-                set.spawn(async move {
-                    black_box(c_ref.fetch_add(1, Ordering::Relaxed));
-                });
-            }
+            scope(async |s| {
+                for _ in 0..TASKS {
+                    // Capture reference to counter from stack
+                    s.spawn(async {
+                        black_box(counter.fetch_add(1, Ordering::Relaxed));
+                    })
+                    .await;
+                }
 
-            while let Some(res) = set.join_next().await {
-                res.unwrap();
-            }
-
-            set.shutdown().await;
+                while !s.is_empty().await {
+                    s.join_next().await;
+                }
+            })
+            .await;
 
             counter.load(Ordering::Relaxed)
         });
