@@ -5,8 +5,7 @@ async fn panicking_task() {
     scope::<(), _, _>(async |s| {
         s.spawn(async {
             panic!("test panic");
-        })
-        .await;
+        });
 
         let res = s.join_next().await;
         assert!(

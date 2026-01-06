@@ -7,11 +7,11 @@ use tokio::{
 #[tokio::test]
 async fn basic_completion() {
     scope(async |s| {
-        s.spawn(async { 1 }).await;
-        s.spawn(async { 2 }).await;
+        s.spawn(async { 1 });
+        s.spawn(async { 2 });
 
         let mut results = vec![];
-        while !s.is_empty().await {
+        while !s.is_empty() {
             if let Some(Ok(val)) = s.join_next().await {
                 results.push(val);
             }
@@ -34,11 +34,11 @@ async fn join_next_returns_none_when_empty() {
 #[tokio::test]
 async fn len_and_spawn() {
     scope::<u32, _, _>(async |s| {
-        assert_eq!(s.len().await, 0);
+        assert_eq!(s.len(), 0);
 
-        s.spawn(async { 1 }).await;
-        s.spawn(async { 2 }).await;
-        assert_eq!(s.len().await, 2);
+        s.spawn(async { 1 });
+        s.spawn(async { 2 });
+        assert_eq!(s.len(), 2);
     })
     .await;
 }
@@ -53,12 +53,9 @@ async fn try_join_next_non_blocking() {
             sleep(Duration::from_millis(50)).await;
             notify.notify_waiters();
             42
-        })
-        .await;
+        });
 
         // Immediately try join: should return None (task not ready)
-        // Note: In the mutex version, this might also return None if lock contention
-        // existed, but here we are single-threaded in the control logic.
         assert!(s.try_join_next().is_none());
 
         // Wait for it to complete

@@ -5,12 +5,11 @@ use tokio::time::sleep;
 #[tokio::test]
 async fn join_all_completion_order() {
     scope::<u32, _, _>(async |s| {
-        s.spawn(async { 1 }).await;
+        s.spawn(async { 1 });
         s.spawn(async {
             sleep(Duration::from_millis(50)).await;
             2
-        })
-        .await;
+        });
 
         let results = s.join_all().await;
 
@@ -28,12 +27,11 @@ async fn abort_all() {
             s.spawn(async {
                 sleep(Duration::from_millis(100)).await;
                 5
-            })
-            .await;
+            });
         }
 
-        // Abort all tasks immediately
-        s.abort_all().await;
+        // Abort all tasks immediately (synchronous)
+        s.abort_all();
 
         // Await remaining tasks
         let results = s.join_all().await;
@@ -46,22 +44,17 @@ async fn abort_all() {
 
 #[tokio::test]
 async fn shutdown_graceful_abort_behavior() {
-    // Note: The original test used `shutdown()` which consumed the set.
-    // In the `scope` API, shutdown happens automatically at the end of the scope.
-    // We simulate explicit shutdown logic by aborting and joining manually.
     scope::<u32, _, _>(async |s| {
         s.spawn(async {
             sleep(Duration::from_millis(50)).await;
             10
-        })
-        .await;
+        });
         s.spawn(async {
             sleep(Duration::from_millis(100)).await;
             20
-        })
-        .await;
+        });
 
-        s.abort_all().await;
+        s.abort_all();
         let results = s.join_all().await;
 
         assert_eq!(results.len(), 2);

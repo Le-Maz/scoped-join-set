@@ -22,11 +22,10 @@ async fn task_drops_properly() {
             let drop_counter = DropCounter(dropped.clone());
             s.spawn(async move {
                 drop(drop_counter);
-            })
-            .await;
+            });
         }
 
-        while !s.is_empty().await {
+        while !s.is_empty() {
             s.join_next().await;
         }
     })
@@ -39,10 +38,8 @@ async fn task_drops_properly() {
 async fn scope_lifetime_enforced() {
     let value = 99;
 
-    // The previous test helper `scoped_spawn` is replaced by the direct usage of `scope`.
-    // The compiler enforces that `value` outlives the closure.
     scope::<i32, _, _>(async |s| {
-        s.spawn(async { value }).await;
+        s.spawn(async { value });
 
         assert!(matches!(s.join_next().await, Some(Ok(99))));
     })
@@ -57,8 +54,7 @@ async fn none_on_dropped_future() {
         s.spawn(async move {
             let _ = rx.await;
             10
-        })
-        .await;
+        });
 
         // We exit the scope, triggering implicit abort/join of the task.
     })

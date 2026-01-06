@@ -18,14 +18,13 @@ async fn tasks_run_concurrently() {
                 sleep(Duration::from_millis(50)).await;
                 finished.fetch_add(1, Ordering::SeqCst);
                 1
-            })
-            .await;
+            });
         }
 
         sleep(Duration::from_millis(10)).await;
         assert_eq!(started.load(Ordering::SeqCst), 3);
 
-        while !s.is_empty().await {
+        while !s.is_empty() {
             s.join_next().await;
         }
 

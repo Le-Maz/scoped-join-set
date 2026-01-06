@@ -19,12 +19,12 @@ fn spawn_regular_tasks(b: &mut Bencher) {
         rt.block_on(async {
             scope(async |s| {
                 for i in 0..TASKS {
-                    // s.spawn is now async
-                    black_box(s.spawn(async move { i * 2 }).await);
+                    // s.spawn is now synchronous
+                    black_box(s.spawn(async move { i * 2 }));
                 }
 
                 let mut results = Vec::with_capacity(TASKS);
-                while !s.is_empty().await {
+                while !s.is_empty() {
                     if let Some(Ok(res)) = s.join_next().await {
                         results.push(res);
                     }
@@ -49,11 +49,10 @@ fn use_shared_state(b: &mut Bencher) {
                     // Capture reference to counter from stack
                     s.spawn(async {
                         black_box(counter.fetch_add(1, Ordering::Relaxed));
-                    })
-                    .await;
+                    });
                 }
 
-                while !s.is_empty().await {
+                while !s.is_empty() {
                     s.join_next().await;
                 }
             })

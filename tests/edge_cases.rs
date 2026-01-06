@@ -19,8 +19,7 @@ async fn long_poll() {
                 Poll::Ready(reference.clone())
             })
             .await;
-        })
-        .await;
+        });
     })
     .await;
 
@@ -28,7 +27,7 @@ async fn long_poll() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn special_drop() {
+async fn drop_panic() {
     let local_variable = "local variable".to_string();
 
     struct SpecialDrop<'a> {
@@ -53,7 +52,7 @@ async fn special_drop() {
 
     impl<'a> Drop for SpecialDrop<'a> {
         fn drop(&mut self) {
-            self.reference.to_string();
+            panic!("{}", self.reference)
         }
     }
 
@@ -62,8 +61,7 @@ async fn special_drop() {
             let f = SpecialDrop::new(&local_variable);
             tokio::time::sleep(Duration::from_millis(20)).await;
             f.await;
-        })
-        .await;
+        });
     })
     .await;
 

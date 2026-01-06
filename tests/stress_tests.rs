@@ -13,13 +13,13 @@ async fn many_tasks_complete_successfully() {
 
     scope(async |s| {
         for i in 0..num_tasks {
-            s.spawn(async move { i }).await;
+            s.spawn(async move { i });
         }
 
         let mut sum = 0usize;
         let mut count = 0;
 
-        while !s.is_empty().await {
+        while !s.is_empty() {
             if let Some(Ok(val)) = s.join_next().await {
                 sum += val;
                 count += 1;
@@ -53,14 +53,13 @@ async fn dropping_scope_while_tasks_pending() {
                 sleep(Duration::from_secs(10)).await; // won't complete
                 drop(dropper);
                 0
-            })
-            .await;
+            });
         }
 
         // We simulate "shutdown" by aborting everything before leaving the scope.
         // Implicitly, `scope` also cleans up, but for the test we want to assert
         // drop counts after everything returns.
-        s.abort_all().await;
+        s.abort_all();
     })
     .await;
 
@@ -72,7 +71,7 @@ async fn dropping_scope_while_tasks_pending() {
 async fn interleaved_spawn_and_join() {
     scope::<usize, _, _>(async |s| {
         for i in 0..1000 {
-            s.spawn(async move { i }).await;
+            s.spawn(async move { i });
             if i % 50 == 0 {
                 if let Some(Ok(_)) = s.join_next().await {
                     // Intentionally interleave
@@ -81,7 +80,7 @@ async fn interleaved_spawn_and_join() {
         }
 
         let mut count = 0;
-        while !s.is_empty().await {
+        while !s.is_empty() {
             if let Some(Ok(_)) = s.join_next().await {
                 count += 1;
             }
@@ -99,7 +98,7 @@ async fn many_scoped_references() {
     // We rewrite the helper function to be a direct scope call
     scope(async |s| {
         for val in &values {
-            s.spawn(async move { *val }).await;
+            s.spawn(async move { *val });
         }
 
         let mut results = vec![];

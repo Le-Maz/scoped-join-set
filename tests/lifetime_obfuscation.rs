@@ -11,7 +11,7 @@ async fn borrowed_struct_result() {
     let num = 123;
     
     scope(async |s| {
-        s.spawn(async { Borrowed { val: &num } }).await;
+        s.spawn(async { Borrowed { val: &num } });
 
         let res = s.join_next().await.unwrap().unwrap();
         assert_eq!(*res.val, 123);
@@ -24,8 +24,8 @@ async fn multiple_borrowed_results() {
     let b = 20;
 
     scope(async |s| {
-        s.spawn(async { &a }).await;
-        s.spawn(async { &b }).await;
+        s.spawn(async { &a });
+        s.spawn(async { &b });
 
         let mut results = vec![];
         while let Some(res) = s.join_next().await {
@@ -57,7 +57,7 @@ async fn nested_borrow_result() {
             Outer {
                 inner: Inner { slice },
             }
-        }).await;
+        });
 
         let res = s.join_next().await.unwrap().unwrap();
         assert_eq!(res.inner.slice, "nested");
@@ -70,8 +70,8 @@ async fn borrowed_and_owned_mixed() {
     let slice: &str = &text;
 
     scope(async |s| {
-        s.spawn(async { Cow::Borrowed(slice) }).await;
-        s.spawn(async { Cow::Owned("owned".to_string()) }).await;
+        s.spawn(async { Cow::Borrowed(slice) });
+        s.spawn(async { Cow::Owned("owned".to_string()) });
 
         let mut results = vec![];
         while let Some(result) = s.join_next().await {
