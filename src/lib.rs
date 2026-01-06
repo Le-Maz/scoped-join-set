@@ -7,6 +7,7 @@
 //! environment (non-`'static` futures) because they are guaranteed to complete
 //! before the scope exits.
 
+/// Internal module containing helper types for type-erasing futures and handling output pointers.
 mod future_wrappers;
 
 use crate::future_wrappers::{SendPtr, WriteOutput};
@@ -42,7 +43,7 @@ where
     TaskResult: 'env + Send,
 {
     /// Creates a new, empty `ScopedJoinSet`.
-    fn new() -> Self {
+    unsafe fn new() -> Self {
         Self {
             join_set: JoinSet::new(),
             _marker: PhantomData,
@@ -65,7 +66,8 @@ where
             Box::leak(Box::new(MaybeUninit::uninit())).into();
 
         // Wrap the user's task to write the output to the allocated slot upon completion.
-        let wrapped_task = WriteOutput::new(task, output_slot.cast());
+        // This is unsafe because we are creating the WriteOutput wrapper.
+        let wrapped_task = unsafe { WriteOutput::new(task, output_slot.cast()) };
 
         // Safety: We are casting lifetimes to 'static to satisfy Tokio's API.
         // The safety is guaranteed by `scope` awaiting all tasks before returning,
@@ -228,22 +230,49 @@ where
     }
 }
 
+/// Guard structure that ensures the process aborts if the scope is dropped unsafely.
+///
+/// If the `scope` future is cancelled (dropped) before the internal `ScopedJoinSet`
+/// has finished joining all tasks, this guard's `Drop` implementation will trigger.
+/// This prevents undefined behavior where background tasks might access the
+/// stack frame of the cancelled scope.
+struct AbortOnDrop;
+
+impl Drop for AbortOnDrop {
+    /// Aborts the process immediately to ensure memory safety.
+    fn drop(&mut self) {
+        eprintln!("Tried to cancel task scope");
+        std::process::abort();
+    }
+}
+
 /// Creates a scope for spawning non-`'static` futures.
 ///
 /// The provided `closure` receives a `Scope` handle which can be used to spawn
 /// tasks. The scope guarantees that all spawned tasks will be joined or aborted
 /// before the function returns.
 ///
-/// # Arguments
+/// # Cancellation Safety
 ///
-/// * `closure` - An async closure that takes a mutable reference to `Scope`.
+/// This future is **not** cancellation safe. If the future returned by this function
+/// is dropped before it completes (e.g., by wrapping it in `tokio::time::timeout`
+/// or `tokio::select!`), the process will be **aborted** (via [`std::process::abort`]).
 pub async fn scope<'env, TaskResult, Closure, ClosureResult>(closure: Closure) -> ClosureResult
 where
     TaskResult: Send + 'env,
     // The closure must accept a mutable reference to Scope with the lifetime 's.
     Closure: for<'s> AsyncFnOnce(&'s mut Scope<'s, 'env, TaskResult>) -> ClosureResult,
 {
-    let mut task_set = ScopedJoinSet::<TaskResult>::new();
+    let guard = AbortOnDrop;
+
+    // Safety: Creating the `ScopedJoinSet` is safe here because this function
+    // establishes the necessary runtime guarantees for non-`'static` tasks.
+    // Specifically:
+    // 1. We ensure all tasks are joined or aborted before this function returns.
+    // 2. The `AbortOnDrop` guard ensures that if this scope is cancelled (dropped)
+    //    prematurely, the process aborts. This prevents background tasks from
+    //    accessing the stack frame after it has been deallocated.
+    let mut task_set = unsafe { ScopedJoinSet::<TaskResult>::new() };
 
     let mut scope_handle = Scope {
         task_set: &mut task_set,
@@ -254,6 +283,10 @@ where
     // Ensure all tasks are cleaned up before returning.
     task_set.abort_all();
     task_set.join_all().await;
+
+    drop(task_set);
+
+    std::mem::forget(guard);
 
     result
 }

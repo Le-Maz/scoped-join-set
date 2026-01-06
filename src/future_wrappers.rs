@@ -6,7 +6,7 @@
 //!
 //! `WriteOutput<F, T>` wraps a user future `F: Future<Output = T>` and writes
 //! its output into a caller-provided heap allocation rather than returning it
-//! directly.  
+//! directly.
 //!
 //! The wrapper future itself always returns a `SendPtr`, which is simply a
 //! raw non-null pointer identifying the output slot. `ScopedJoinSet` uses
@@ -15,7 +15,7 @@
 //!
 //! # Why this is needed
 //!
-//! Tokio only allows spawning `'static` futures.  
+//! Tokio only allows spawning `'static` futures.
 //! `ScopedJoinSet` accepts futures with arbitrary lifetimes `'scope`.
 //!
 //! To bridge this safely without extra bookkeeping structures:
@@ -53,12 +53,14 @@ use std::{
 /// structures are required.
 #[repr(transparent)]
 pub(crate) struct SendPtr {
+    /// The underlying raw non-null pointer to the task output.
     inner: NonNull<u8>,
 }
 
 impl Deref for SendPtr {
     type Target = NonNull<u8>;
 
+    /// Dereferences the `SendPtr` to access the underlying `NonNull` pointer.
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -67,12 +69,21 @@ impl Deref for SendPtr {
 
 impl SendPtr {
     /// Creates a new `SendPtr` from a non-null pointer.
+    ///
+    /// # Safety
+    ///
+    /// This function is marked `unsafe` because it is an internal constructor
+    /// that wraps a raw pointer which must be valid for the duration of its use
+    /// in the `ScopedJoinSet`.
     #[inline]
-    fn new(inner: NonNull<u8>) -> Self {
+    unsafe fn new(inner: NonNull<u8>) -> Self {
         Self { inner }
     }
 }
 
+/// Safety: We assert that transferring this pointer across threads is safe.
+/// This relies on the internal logic of `ScopedJoinSet` ensuring thread safety
+/// of the data being pointed to.
 unsafe impl Send for SendPtr {}
 
 /// Wraps a user future so it can be spawned as `'static` while still
@@ -85,25 +96,37 @@ unsafe impl Send for SendPtr {}
 ///
 /// If the future is dropped before completing (e.g., due to task abortion),
 /// the wrapper deallocates the unused slot.
-pub(crate) struct WriteOutput<F, T> {
-    future: F,
-    output_ptr: NonNull<T>,
+pub(crate) struct WriteOutput<FutureType, TaskOutput> {
+    /// The actual future provided by the user to be polled.
+    future: FutureType,
+    /// A pointer to the heap location where the result should be written.
+    output_ptr: NonNull<TaskOutput>,
+    /// Tracks whether the future completed successfully to handle cleanup on drop.
     success: bool,
 }
 
-unsafe impl<F, T> Send for WriteOutput<F, T> {}
+/// Safety: `WriteOutput` is `Send` if the underlying future is `Send`.
+/// The `output_ptr` is considered safe to send because it points to a
+/// heap allocation managed exclusively by this wrapper and the `ScopedJoinSet`.
+unsafe impl<FutureType, TaskOutput> Send for WriteOutput<FutureType, TaskOutput> {}
 
-impl<'scope, F, T> WriteOutput<F, T>
+impl<'scope, FutureType, TaskOutput> WriteOutput<FutureType, TaskOutput>
 where
-    F: Future<Output = T> + Send + 'scope,
-    T: 'scope,
+    FutureType: Future<Output = TaskOutput> + Send + 'scope,
+    TaskOutput: 'scope,
 {
     /// Creates a new wrapper over the given future and output pointer.
     ///
     /// `output_ptr` must point to a valid, writable heap allocation that will
     /// outlive the spawned task.
+    ///
+    /// # Safety
+    ///
+    /// This is an internal function marked `unsafe`. The caller must ensure
+    /// that `output_ptr` is valid and that the resulting `WriteOutput` is
+    /// managed correctly to prevent memory leaks or use-after-free errors.
     #[inline]
-    pub fn new(future: F, output_ptr: NonNull<T>) -> Self {
+    pub(crate) unsafe fn new(future: FutureType, output_ptr: NonNull<TaskOutput>) -> Self {
         Self {
             future,
             output_ptr,
@@ -128,9 +151,9 @@ where
     }
 }
 
-impl<F, T> Future for WriteOutput<F, T>
+impl<FutureType, TaskOutput> Future for WriteOutput<FutureType, TaskOutput>
 where
-    F: Future<Output = T>,
+    FutureType: Future<Output = TaskOutput>,
 {
     type Output = SendPtr;
 
@@ -139,19 +162,20 @@ where
     /// - marks the wrapper as successfully completed,
     /// - returns a pointer identifying the output slot.
     #[inline]
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<SendPtr> {
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<SendPtr> {
         let this = unsafe { self.get_unchecked_mut() };
-        let fut = unsafe { Pin::new_unchecked(&mut this.future) };
+        // Create a pinned reference to the inner future to poll it.
+        let future_pinned = unsafe { Pin::new_unchecked(&mut this.future) };
 
-        let output = ready!(fut.poll(cx));
+        let output = ready!(future_pinned.poll(context));
         unsafe { this.output_ptr.write(output) };
         this.success = true;
 
-        Poll::Ready(SendPtr::new(this.output_ptr.cast()))
+        Poll::Ready(unsafe { SendPtr::new(this.output_ptr.cast()) })
     }
 }
 
-impl<F, T> Drop for WriteOutput<F, T> {
+impl<FutureType, TaskOutput> Drop for WriteOutput<FutureType, TaskOutput> {
     /// On drop, if the user future never completed, the associated heap output
     /// allocation is reclaimed.
     ///
