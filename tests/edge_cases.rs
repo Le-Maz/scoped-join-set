@@ -81,5 +81,31 @@ async fn drop_uninit_memory_crash() {
 
         // Abort immediately, triggering WriteOutput::drop on the uninit slot
         s.abort_all();
-    }).await;
+    })
+    .await;
+}
+
+/// Verifies that the library correctly handles Zero Sized Types (ZSTs).
+///
+/// ZSTs (like `()`) often have dangling pointers or optimization quirks.
+/// We ensure that `Box::from_raw` logic handles unit types without segfaulting.
+#[tokio::test]
+async fn handle_zero_sized_types() {
+    let output = scope::<(), _, _>(async |scope_handle| {
+        scope_handle.spawn(async {
+            // Do some "work"
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            // Return unit
+        });
+
+        // Ensure we can join the ZST result
+        let result = scope_handle.join_next().await;
+        assert!(result.is_some());
+        assert!(result.unwrap().is_ok());
+
+        "Scope Completed"
+    })
+    .await;
+
+    assert_eq!(output, "Scope Completed");
 }
