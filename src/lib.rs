@@ -26,7 +26,7 @@ type TokioJoinError = tokio::task::JoinError;
 /// This structure manages the lifetime of the tasks and ensures their outputs
 /// are correctly typed and returned.
 #[derive(Default)]
-pub struct ScopedJoinSet<'env, TaskResult>
+struct ScopedJoinSet<'env, TaskResult>
 where
     TaskResult: 'env + Send,
 {
@@ -54,7 +54,7 @@ where
     ///
     /// The provided future must be `Send` and live for at least `'env`.
     /// The output of the task is stored in a heap-allocated slot to be retrieved later.
-    pub fn spawn<F>(&mut self, task: F)
+    fn spawn<F>(&mut self, task: F)
     where
         F: Future<Output = TaskResult> + Send + 'env,
         TaskResult: Send,
@@ -83,14 +83,14 @@ where
     }
 
     /// Returns the number of tasks currently in the set.
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.join_set.len()
     }
 
     /// Waits for the next task to complete and returns its result.
     ///
     /// Returns `None` if the set is empty.
-    pub async fn join_next(&mut self) -> Option<Result<TaskResult, JoinError>> {
+    async fn join_next(&mut self) -> Option<Result<TaskResult, JoinError>> {
         match self.join_set.join_next().await? {
             Ok(output_ptr) => {
                 // Reconstruct the typed pointer from the raw SendPtr.
@@ -107,7 +107,7 @@ where
     /// Tries to join the next task without blocking.
     ///
     /// Returns `None` if no tasks have completed or the set is empty.
-    pub fn try_join_next(&mut self) -> Option<Result<TaskResult, JoinError>> {
+    fn try_join_next(&mut self) -> Option<Result<TaskResult, JoinError>> {
         match self.join_set.try_join_next()? {
             Ok(output_ptr) => {
                 let typed_ptr: NonNull<TaskResult> = output_ptr.cast();
@@ -119,14 +119,14 @@ where
     }
 
     /// Aborts all running tasks in the set.
-    pub fn abort_all(&mut self) {
+    fn abort_all(&mut self) {
         self.join_set.abort_all();
     }
 
     /// Drains all tasks, waiting for each to complete.
     ///
     /// Returns a vector containing the results of all tasks.
-    pub async fn join_all(&mut self) -> Vec<Result<TaskResult, JoinError>> {
+    async fn join_all(&mut self) -> Vec<Result<TaskResult, JoinError>> {
         let mut results = Vec::with_capacity(self.len());
         while let Some(result) = self.join_next().await {
             results.push(result);
