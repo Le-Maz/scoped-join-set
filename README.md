@@ -29,18 +29,6 @@ This strict behavior is required for soundness. Tasks spawned within the scope m
 
 ---
 
-## Installation
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-scoped-join-set = "0.7"
-tokio = { version = "1", features = ["full"] }
-```
-
----
-
 ## Usage
 
 The primary entry point is the `scope` function. It ensures that all spawned tasks are joined before the scope exits.
